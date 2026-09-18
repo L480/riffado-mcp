@@ -31,7 +31,8 @@ jobs:
           ignore-unfixed: true
           format: sarif
           output: trivy-image-results.sarif
-      - if: always()
+      # See ci.yml: SARIF upload needs a public repo or GHAS.
+      - if: always() && !github.event.repository.private
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-image-results.sarif

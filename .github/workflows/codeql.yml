@@ -15,6 +15,9 @@ jobs:
   analyze:
     name: Analyze (javascript-typescript)
     runs-on: ubuntu-latest
+    # CodeQL needs a public repo or GitHub Advanced Security. Skipped (green)
+    # rather than failing on a private repo or a private fork.
+    if: ${{ !github.event.repository.private }}
     permissions:
       security-events: write
       contents: read

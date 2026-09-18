@@ -149,7 +149,11 @@ jobs:
           exit-code: "1"
           format: sarif
           output: trivy-results.sarif
-      - if: always()
+      # Code scanning (SARIF upload) needs a public repo or GitHub Advanced
+      # Security; on a private repo without GHAS the upload fails with
+      # "Resource not accessible by integration". The scan itself still runs
+      # and still fails the job on HIGH/CRITICAL via exit-code above.
+      - if: always() && !github.event.repository.private
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
