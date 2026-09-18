@@ -1,9 +1,11 @@
 /**
- * Adapted from L480/mcp-picnic (src/transports/streamable-http.ts). The
- * dual-mount (/mcp and /), dual-auth (shared token + OAuth), 404-on-expired-
- * session and trust-proxy behavior are copied from there because each is a
- * fixed bug — not a stylistic choice — for making Claude's connector work
- * reliably behind the Cloudflare Tunnel.
+ * Adapted from the author's own L480/mcp-picnic fork
+ * (src/transports/streamable-http.ts), which in turn builds on the Streamable
+ * HTTP transport of upstream ivo-toby/mcp-picnic (MIT — see
+ * THIRD-PARTY-NOTICES.md). The dual-mount (/mcp and /), dual-auth (shared
+ * token + OAuth), 404-on-expired-session and trust-proxy behavior come from
+ * the fork, where each was a fix for a real Claude-connector failure rather
+ * than a stylistic choice.
  */
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
 import express, { Request, Response, NextFunction } from "express"

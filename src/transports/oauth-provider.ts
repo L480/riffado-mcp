@@ -1,7 +1,8 @@
 /**
- * Adapted from L480/mcp-picnic (src/transports/oauth-provider.ts) — same
- * static-token-wrapped-in-OAuth-2.1 shape, renamed for Riffado. See that
- * file's history for why each piece here exists.
+ * Ported from the author's own L480/mcp-picnic fork
+ * (src/transports/oauth-provider.ts), where this static-token-wrapped-in-
+ * OAuth-2.1 approach was written to get Claude's custom connectors to
+ * authenticate against a shared secret. Same shape, renamed for Riffado.
  */
 import { Response } from "express"
 import { randomUUID, randomBytes, timingSafeEqual } from "crypto"

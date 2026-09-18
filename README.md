@@ -142,12 +142,14 @@ docker compose -f docker-compose.test.yml down
 
 ## Credits
 
-The OAuth-over-static-token approach in `src/transports/` is adapted from
-[mcp-picnic](https://github.com/ivo-toby/mcp-picnic) (MIT, Copyright (c) 2024
-Ivo Toby), via the [L480/mcp-picnic](https://github.com/L480/mcp-picnic) fork
-that introduced it. The CI/CD layout follows
-[cloudflare-dyndns](https://github.com/L480/cloudflare-dyndns). See
-[`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md).
+The OAuth-over-static-token provider in `src/transports/oauth-provider.ts` is
+ported from [L480/mcp-picnic](https://github.com/L480/mcp-picnic), where it was
+written to make Claude's custom connectors authenticate against a shared
+secret. The Streamable HTTP transport it sits on derives from upstream
+[ivo-toby/mcp-picnic](https://github.com/ivo-toby/mcp-picnic) (MIT, Copyright
+(c) 2024 Ivo Toby) — see
+[`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md). The CI/CD layout follows
+[cloudflare-dyndns](https://github.com/L480/cloudflare-dyndns).
 
 This project is not affiliated with Riffado or Plaud.
 

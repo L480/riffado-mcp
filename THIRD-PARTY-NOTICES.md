@@ -1,17 +1,21 @@
 # Third-party notices
 
 This project is MIT licensed (see [`LICENSE`](./LICENSE)) and contains code
-adapted from the third-party work listed below. Their copyright notices and
-license texts are reproduced here as those licenses require.
+derived from the third-party work listed below. Its copyright notice and
+license text are reproduced here as that license requires.
 
 ## mcp-picnic
 
-`src/transports/oauth-provider.ts` and `src/transports/streamable-http.ts` are
-adapted from [mcp-picnic](https://github.com/ivo-toby/mcp-picnic) (via the
-[L480/mcp-picnic](https://github.com/L480/mcp-picnic) fork, which added the
-OAuth wrapper these files are based on). The `StaticTokenOAuthProvider`
-approach — wrapping a shared secret in an OAuth 2.1 flow so that clients which
-only speak OAuth can authenticate — originates there.
+`src/transports/streamable-http.ts` derives from the Streamable HTTP transport
+of [ivo-toby/mcp-picnic](https://github.com/ivo-toby/mcp-picnic).
+
+It was taken from this project's author's own
+[L480/mcp-picnic](https://github.com/L480/mcp-picnic) fork, and the OAuth 2.1
+wrapper it integrates — `src/transports/oauth-provider.ts`, the
+`StaticTokenOAuthProvider` that lets OAuth-only clients such as Claude's
+custom connectors authenticate against a shared secret — is that author's own
+work, written in the fork. No third-party notice is required for that part;
+the notice below covers the upstream transport it sits on.
 
 ```
 MIT License
@@ -39,11 +43,11 @@ SOFTWARE.
 
 ## cloudflare-dyndns
 
-The GitHub Actions layout under `.github/workflows/` follows
+The GitHub Actions layout under `.github/workflows/` follows this author's
 [L480/cloudflare-dyndns](https://github.com/L480/cloudflare-dyndns)
-(Apache-2.0, same author as this project) — release-on-tag with multi-arch
-build, SBOM, provenance and cosign signing, plus the CI job matrix. Credited
-for provenance; no notice is required.
+(Apache-2.0) — release-on-tag with multi-arch build, SBOM, provenance and
+cosign signing, plus the CI job matrix. Same author, so no notice is required;
+listed for provenance.
 
 ## Runtime dependencies
 
