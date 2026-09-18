@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
+
+FROM deps AS build
+WORKDIR /app
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ARG APP_UID=7333
+
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --ignore-scripts
+
+COPY --from=build /app/dist ./dist
+
+# Rootless, own UID:GID (7333 is free on node1; 7331 is riffado itself — see
+# agent-infra CLAUDE.md docker-compose conventions). /app/data is the only
+# writable path: the container runs with --read-only in production and CI.
+RUN addgroup -S -g ${APP_UID} riffado-mcp \
+  && adduser -S -D -H -u ${APP_UID} -G riffado-mcp riffado-mcp \
+  && mkdir -p /app/data \
+  && chown -R riffado-mcp:riffado-mcp /app
+
+ENV TRANSPORT=http
+ENV HTTP_HOST=0.0.0.0
+ENV HTTP_OAUTH_STATE_FILE=/app/data/oauth-state.json
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+USER 7333
+
+ENTRYPOINT ["node", "dist/index.js"]
