@@ -1,0 +1,20 @@
+# Throwaway Postgres for `npm run test:integration` locally. CI uses a
+# service container instead (see .github/workflows/ci.yml); this file is for
+# local development only, never referenced by the image build.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: riffado_test
+    ports:
+      - "127.0.0.1:5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

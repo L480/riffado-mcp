@@ -37,10 +37,14 @@ interface Row {
   action_items: string | null
 }
 
+// key_points/action_items are cast to text: pg auto-parses jsonb columns
+// into JS values, but decryptJson() (shared with riffado_export.py's logic)
+// expects the raw JSON string so it can tell a plain array apart from the
+// {"c": "<ciphertext>"} encrypted-wrapper shape before parsing it itself.
 const BASE_QUERY = `
 SELECT r.id, r.user_id, r.filename, r.duration, r.start_time,
        t.source, t.provider, t.model, t.detected_language, t.text,
-       e.summary, e.key_points, e.action_items
+       e.summary, e.key_points::text AS key_points, e.action_items::text AS action_items
 FROM recordings r
 LEFT JOIN transcriptions t ON t.recording_id = r.id
 LEFT JOIN ai_enhancements e ON e.recording_id = r.id
