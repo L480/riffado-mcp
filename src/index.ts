@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { config } from "./config.js"
+import { loadConfig } from "./config.js"
 import { createPool } from "./riffado/db.js"
 import { parseEncryptionKey } from "./riffado/crypto.js"
 import { RecordingStore } from "./riffado/store.js"
@@ -9,6 +9,7 @@ import { StreamableHttpServer } from "./transports/streamable-http.js"
 import type { RiffadoTransportServer } from "./transports/base.js"
 
 async function main(): Promise<void> {
+  const config = loadConfig()
   const pool = createPool({
     connectionString: config.DATABASE_URL,
     statementTimeoutMs: config.DB_STATEMENT_TIMEOUT_MS,

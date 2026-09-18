@@ -3,7 +3,10 @@ import os from "os"
 import path from "path"
 import dotenv from "dotenv"
 
-dotenv.config()
+// `quiet: true` matters here, not just for tidy logs: dotenv >=16.4 writes a
+// banner to stdout by default, and stdout is the JSON-RPC channel on the
+// stdio transport — an unsuppressed banner would corrupt every message.
+dotenv.config({ quiet: true })
 
 const defaultOAuthStateFile = path.join(os.homedir(), ".riffado-mcp-oauth-state.json")
 
@@ -69,5 +72,3 @@ export type Config = z.infer<typeof configSchema>
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return configSchema.parse(env)
 }
-
-export const config = loadConfig()
