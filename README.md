@@ -77,9 +77,6 @@ npm run build
    then holds a normal OAuth bearer token — the connector survives process
    restarts because OAuth state is persisted to `HTTP_OAUTH_STATE_FILE`.
 
-No Cloudflare Access in front of this route — it would break the MCP OAuth
-flow described above (see `docs/architecture.md`).
-
 ## Docker Compose example
 
 ```yaml
@@ -135,10 +132,6 @@ docker compose -f docker-compose.test.yml down
 - **No audio, no storage paths, no credentials, no other users' rows** are
   exposed by any tool.
 - Container runs rootless (`7333:7333`), `--read-only`, `cap-drop: ALL`.
-- **Do not put Cloudflare Access or another identity-aware proxy in front of
-  the HTTP route** — it breaks the MCP OAuth flow, which makes
-  `HTTP_AUTH_TOKEN` the actual access control. See
-  [`SECURITY.md`](./SECURITY.md) for the full threat model.
 
 ## License
 
