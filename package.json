@@ -1,6 +1,6 @@
 {
   "name": "riffado-mcp",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "MCP server for the Riffado voice-recording archive (transcripts, AI summaries, key points, action items) — read-only.",
   "license": "MIT",
   "author": "Nico Struck",
@@ -60,11 +60,11 @@
     "@types/express": "^5.0.6",
     "@types/node": "^22.20.3",
     "@types/pg": "^8.23.1",
-    "@vitest/coverage-v8": "^3.2.7",
+    "@vitest/coverage-v8": "^4.1.11",
     "eslint": "^9.39.5",
     "prettier": "^3.9.8",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.70.0",
-    "vitest": "^3.2.7"
+    "vitest": "^4.1.11"
   }
 }
