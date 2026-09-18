@@ -1,0 +1,54 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not paste real transcript content, `ENCRYPTION_KEY` values,
+        database credentials or auth tokens. Redact them first.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start the server with TRANSPORT=...
+        2. Call the tool ... with ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - stdio
+        - Streamable HTTP
+        - both / unsure
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: Claude Code 2.x / Claude Web / Claude iOS / MCP Inspector
+  - type: input
+    id: version
+    attributes:
+      label: riffado-mcp version
+      placeholder: image tag, release, or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Server stderr. Redact secrets.
+      render: shell

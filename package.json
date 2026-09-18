@@ -3,8 +3,25 @@
   "version": "0.1.0",
   "description": "MCP server for the Riffado voice-recording archive (transcripts, AI summaries, key points, action items) — read-only.",
   "license": "MIT",
+  "author": "Nico Struck",
   "type": "module",
   "private": true,
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "riffado",
+    "plaud",
+    "transcription",
+    "claude"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/L480/riffado-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/L480/riffado-mcp/issues"
+  },
+  "homepage": "https://github.com/L480/riffado-mcp#readme",
   "bin": {
     "riffado-mcp": "dist/index.js"
   },

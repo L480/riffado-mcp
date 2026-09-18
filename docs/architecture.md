@@ -32,11 +32,12 @@ login page, and in exchange receives a normal OAuth access token used as
 itself (as a raw bearer or the `x-mcp-token` header) still works directly,
 for stdio-adjacent or scripted use.
 
-## No Cloudflare Access in front
+## Don't put an identity-aware proxy in front
 
-`riffado-mcp.example.com` is exposed via the Cloudflare Tunnel with no Access
-policy. Access would intercept the request with its own OAuth challenge
-before the MCP OAuth flow above ever runs — Claude's connector would be
-authenticating against Cloudflare, not against this server, and the MCP
-authorization flow would never complete. The static-token-wrapped-OAuth
-provider is the access control for this route.
+If you expose this through Cloudflare Tunnel or an equivalent, do it **without**
+Cloudflare Access or any comparable identity-aware proxy. Such a proxy
+intercepts the request with its own OAuth challenge before the MCP OAuth flow
+above ever runs: Claude's connector then authenticates against the proxy rather
+than against this server, and the MCP authorization flow never completes. The
+static-token-wrapped OAuth provider _is_ the access control for the route —
+which is exactly why `HTTP_AUTH_TOKEN` has to be a real secret.

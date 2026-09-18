@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a tool, resource or capability
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Note: this server is **read-only** by design and the database it reads
+        only ever holds ciphertext. Requests for write tools (deleting,
+        renaming, re-summarizing recordings) or for SQL-side search are out of
+        scope — see `docs/architecture.md`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What question can't you answer, or what task can't you do, today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: A new tool, an extra argument on an existing one, a resource, …
+    validations:
+      required: true

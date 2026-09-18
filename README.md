@@ -1,5 +1,9 @@
 # riffado-mcp
 
+[![CI](https://github.com/L480/riffado-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/L480/riffado-mcp/actions/workflows/ci.yml)
+[![Release](https://github.com/L480/riffado-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/L480/riffado-mcp/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 An MCP server for the [Riffado](https://riffado.com) voice-recording archive
 (Plaud device → Riffado app): transcripts, AI summaries, key points, action
 items. Strictly read-only. Talks to the Riffado Postgres database directly
@@ -28,7 +32,7 @@ ASR misreads, never fill gaps from general knowledge).
 | `DATABASE_URL`            | _required_                        | `postgresql://postgres:…@riffado-db:5432/riffado`                                    |
 | `ENCRYPTION_KEY`          | _required_                        | 64 hex chars (32-byte AES key)                                                       |
 | `RIFFADO_USER_ID`         | —                                 | restrict to one user                                                                 |
-| `RIFFADO_APP_URL`         | —                                 | e.g. `https://riffado.example.com` → deep links in tool output                         |
+| `RIFFADO_APP_URL`         | —                                 | e.g. `https://riffado.example.com` → deep links in tool output                       |
 | `TRANSPORT`               | `stdio`                           | `stdio` \| `http`                                                                    |
 | `HTTP_PORT` / `HTTP_HOST` | `3000` / `localhost`              | container sets host `0.0.0.0`                                                        |
 | `HTTP_AUTH_TOKEN`         | —                                 | shared secret; unset = HTTP transport runs **unauthenticated** (loud warning logged) |
@@ -131,3 +135,22 @@ docker compose -f docker-compose.test.yml down
 - **No audio, no storage paths, no credentials, no other users' rows** are
   exposed by any tool.
 - Container runs rootless (`7333:7333`), `--read-only`, `cap-drop: ALL`.
+- **Do not put Cloudflare Access or another identity-aware proxy in front of
+  the HTTP route** — it breaks the MCP OAuth flow, which makes
+  `HTTP_AUTH_TOKEN` the actual access control. See
+  [`SECURITY.md`](./SECURITY.md) for the full threat model.
+
+## Credits
+
+The OAuth-over-static-token approach in `src/transports/` is adapted from
+[mcp-picnic](https://github.com/ivo-toby/mcp-picnic) (MIT, Copyright (c) 2024
+Ivo Toby), via the [L480/mcp-picnic](https://github.com/L480/mcp-picnic) fork
+that introduced it. The CI/CD layout follows
+[cloudflare-dyndns](https://github.com/L480/cloudflare-dyndns). See
+[`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md).
+
+This project is not affiliated with Riffado or Plaud.
+
+## License
+
+[MIT](./LICENSE)
