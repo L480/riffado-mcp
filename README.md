@@ -140,19 +140,6 @@ docker compose -f docker-compose.test.yml down
   `HTTP_AUTH_TOKEN` the actual access control. See
   [`SECURITY.md`](./SECURITY.md) for the full threat model.
 
-## Credits
-
-The OAuth-over-static-token provider in `src/transports/oauth-provider.ts` is
-ported from [L480/mcp-picnic](https://github.com/L480/mcp-picnic), where it was
-written to make Claude's custom connectors authenticate against a shared
-secret. The Streamable HTTP transport it sits on derives from upstream
-[ivo-toby/mcp-picnic](https://github.com/ivo-toby/mcp-picnic) (MIT, Copyright
-(c) 2024 Ivo Toby) — see
-[`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md). The CI/CD layout follows
-[cloudflare-dyndns](https://github.com/L480/cloudflare-dyndns).
-
-This project is not affiliated with Riffado or Plaud.
-
 ## License
 
 [MIT](./LICENSE)
