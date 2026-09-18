@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+.DS_Store
+*.riffado-mcp-oauth-state.json
+oauth-state.json
