@@ -1,10 +1,8 @@
 /**
- * Adapted from the author's own L480/mcp-picnic fork
- * (src/transports/streamable-http.ts), which in turn builds on the Streamable
- * HTTP transport of upstream ivo-toby/mcp-picnic (MIT — see
- * THIRD-PARTY-NOTICES.md). The dual-mount (/mcp and /), dual-auth (shared
- * token + OAuth), 404-on-expired-session and trust-proxy behavior come from
- * the fork, where each was a fix for a real Claude-connector failure rather
+ * Ported from the author's own L480/mcp-picnic fork
+ * (src/transports/streamable-http.ts). The dual-mount (/mcp and /), dual-auth
+ * (shared token + OAuth), 404-on-expired-session and trust-proxy behavior come
+ * from there, where each was a fix for a real Claude-connector failure rather
  * than a stylistic choice.
  */
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
@@ -47,11 +45,17 @@ export interface StreamableHttpServerOptions {
   maxRequestSizeBytes?: number
   enableRequestLogging?: boolean
   maxConcurrentSessions?: number
-  /** 0 (default) disables idle expiry and keeps sessions open indefinitely. */
+  /** Idle-session expiry in ms; default 3600000 (1h). Set to 0 to opt out
+   * and keep sessions open indefinitely — see README's
+   * `HTTP_SESSION_TIMEOUT_MS` for why that default is not itself 0: an
+   * MCP client that re-initializes on every 404 (Claude's connector does,
+   * see the 404-not-400 note above) plus a `maxConcurrentSessions` cap
+   * means idle sessions that are never explicitly closed eventually starve
+   * out every new `initialize` with a permanent 503. */
   sessionTimeoutMs?: number
   /** Builds one MCP server instance per session. */
   createServer: () => McpServer
-  /** Backs `/health`'s DB-reachability + cached-recording-count fields. */
+  /** Backs `/health/details`'s DB-reachability + cached-recording-count fields. */
   healthCheck?: () => Promise<HealthDetails>
 }
 
@@ -87,7 +91,7 @@ export class StreamableHttpServer implements RiffadoTransportServer {
       maxRequestSizeBytes: 1024 * 1024 * 10,
       enableRequestLogging: true,
       maxConcurrentSessions: 100,
-      sessionTimeoutMs: 0,
+      sessionTimeoutMs: 3600000,
       ...options,
     }
     this.port = this.options.port!
@@ -136,6 +140,21 @@ export class StreamableHttpServer implements RiffadoTransportServer {
           exposedHeaders: ["MCP-Session-ID", "WWW-Authenticate"],
         },
       ),
+    )
+
+    // Tighter limit than the global one above, scoped to the unauthenticated
+    // OAuth endpoints (dynamic client registration is unauthenticated by
+    // spec, and /authorize + /token are the rest of the login flow that
+    // never require the shared token to even reach the handler). Mounted
+    // before setupOAuth() so it actually covers the routes it mounts.
+    this.app.use(
+      ["/register", "/authorize", "/token"],
+      rateLimit({
+        windowMs: 15 * 60 * 1000,
+        limit: 30,
+        standardHeaders: true,
+        legacyHeaders: false,
+      }),
     )
 
     this.setupOAuth()
@@ -322,7 +341,16 @@ export class StreamableHttpServer implements RiffadoTransportServer {
       }
     })
 
-    this.app.get("/health", async (_req: Request, res: Response) => {
+    // Liveness only — the one route the auth middleware exempts, so it must
+    // never leak anything about the server's internal state (session
+    // count, DB reachability, cached-recording count) to an unauthenticated
+    // caller. That detail lives at /health/details instead, which the auth
+    // middleware does NOT exempt.
+    this.app.get("/health", (_req: Request, res: Response) => {
+      res.status(200).json({ status: "ok", timestamp: new Date().toISOString() })
+    })
+
+    this.app.get("/health/details", async (_req: Request, res: Response) => {
       const base = {
         status: "ok",
         timestamp: new Date().toISOString(),

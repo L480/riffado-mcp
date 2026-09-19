@@ -109,7 +109,7 @@ jobs:
             -p 3000:3000 \
             -e DATABASE_URL="postgresql://postgres:postgres@localhost:5432/riffado" \
             -e ENCRYPTION_KEY="$(printf 'a%.0s' $(seq 1 64))" \
-            -e HTTP_AUTH_TOKEN="ci-smoke-test-token" \
+            -e HTTP_AUTH_TOKEN="ci-smoke-test-token-32-characters-long" \
             riffado-mcp:ci
           for i in $(seq 1 20); do
             if curl -fsS http://localhost:3000/health; then break; fi

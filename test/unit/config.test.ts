@@ -70,4 +70,37 @@ describe("loadConfig", () => {
   it("rejects an unknown TRANSPORT", () => {
     expect(() => loadConfig({ ...BASE_ENV, TRANSPORT: "carrier-pigeon" })).toThrow()
   })
+
+  describe("HTTP_AUTH_TOKEN minimum length", () => {
+    it("leaves it unset when absent (unauthenticated HTTP transport stays a valid config)", () => {
+      const config = loadConfig(BASE_ENV)
+      expect(config.HTTP_AUTH_TOKEN).toBeUndefined()
+    })
+
+    it("rejects a token shorter than 32 characters", () => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_AUTH_TOKEN: "test" })).toThrow(
+        /at least 32 characters/,
+      )
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_AUTH_TOKEN: "a".repeat(31) })).toThrow(
+        /at least 32 characters/,
+      )
+    })
+
+    it("accepts a token that is exactly 32 characters", () => {
+      const token = "a".repeat(32)
+      expect(loadConfig({ ...BASE_ENV, HTTP_AUTH_TOKEN: token }).HTTP_AUTH_TOKEN).toBe(token)
+    })
+  })
+
+  describe("HTTP_SESSION_TIMEOUT_MS", () => {
+    it("defaults to one hour (3600000ms)", () => {
+      expect(loadConfig(BASE_ENV).HTTP_SESSION_TIMEOUT_MS).toBe(3600000)
+    })
+
+    it("keeps 0 as a valid explicit opt-out (never expire idle sessions)", () => {
+      expect(
+        loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "0" }).HTTP_SESSION_TIMEOUT_MS,
+      ).toBe(0)
+    })
+  })
 })

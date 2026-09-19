@@ -47,15 +47,25 @@ const configSchema = z.object({
     .default("3000")
     .transform((val) => parseInt(val, 10)),
   HTTP_HOST: z.string().default("localhost"),
-  HTTP_AUTH_TOKEN: z.string().optional(),
+  // Optional: unset means the HTTP transport runs unauthenticated (loud
+  // warning logged at startup, see streamable-http.ts) — that path must
+  // keep working. When set, it's the sole access control over the whole
+  // archive, so a short value like "test" must not be accepted.
+  HTTP_AUTH_TOKEN: z
+    .string()
+    .min(32, "HTTP_AUTH_TOKEN must be at least 32 characters when set")
+    .optional(),
   HTTP_AUTH_HEADER_NAME: z.string().default("x-mcp-token"),
   HTTP_OAUTH_ENABLED: boolFromString("true"),
   HTTP_PUBLIC_URL: z.string().refine(isValidUrl, "HTTP_PUBLIC_URL must be a valid URL").optional(),
   HTTP_OAUTH_STATE_FILE: z.string().default(defaultOAuthStateFile),
   HTTP_TRUST_PROXY: trustProxyCoercion,
+  // Default 1h idle expiry. `0` remains a valid explicit opt-out that
+  // disables idle expiry entirely (sessions only end on protocol
+  // close/DELETE) — see README.
   HTTP_SESSION_TIMEOUT_MS: z
     .string()
-    .default("0")
+    .default("3600000")
     .transform((val) => parseInt(val, 10)),
   CACHE_TTL_MS: z
     .string()

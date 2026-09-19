@@ -74,16 +74,50 @@ describe("StreamableHttpServer", () => {
     expect(body.status).toBe("ok")
   })
 
-  it("reports DB reachability and cached recording count via the healthCheck callback", async () => {
+  it("exposes only status+timestamp on /health, nothing else", async () => {
     ;({ server } = await startServer({
       healthCheck: async () => ({ database: { reachable: true }, recordings: { cached: 3 } }),
     }))
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/health")
+    expect(res.statusCode).toBe(200)
+    const body = JSON.parse(res.body)
+    expect(Object.keys(body).sort()).toEqual(["status", "timestamp"])
+    expect(body.sessions).toBeUndefined()
+    expect(body.database).toBeUndefined()
+    expect(body.recordings).toBeUndefined()
+  })
+
+  it("reports DB reachability and cached recording count via /health/details", async () => {
+    ;({ server } = await startServer({
+      healthCheck: async () => ({ database: { reachable: true }, recordings: { cached: 3 } }),
+    }))
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+    const res = await request(port, "/health/details")
+    expect(res.statusCode).toBe(200)
     const body = JSON.parse(res.body)
     expect(body.database.reachable).toBe(true)
     expect(body.recordings.cached).toBe(3)
+    expect(typeof body.sessions).toBe("number")
+  })
+
+  it("requires the same auth as /mcp on /health/details when a token is configured", async () => {
+    ;({ server } = await startServer({
+      authToken: "secret",
+      healthCheck: async () => ({ database: { reachable: true }, recordings: { cached: 0 } }),
+    }))
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+
+    const unauthedRes = await request(port, "/health/details")
+    expect(unauthedRes.statusCode).toBe(401)
+
+    const authedRes = await request(port, "/health/details", {
+      headers: { Authorization: "Bearer secret" },
+    })
+    expect(authedRes.statusCode).toBe(200)
   })
 
   it("routes MCP requests posted to /mcp when unauthenticated (no authToken configured)", async () => {
@@ -243,5 +277,56 @@ describe("StreamableHttpServer", () => {
     expect(() => server.cleanupSession(sessionId)).not.toThrow()
     expect(transport.closeCalls).toBe(1)
     expect(server.getActiveSessions()).not.toContain(sessionId)
+  })
+
+  async function initSession(port: number): Promise<string> {
+    const initRes = await request(port, "/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "test", version: "0.0.0" },
+        },
+      }),
+    })
+    return initRes.headers["mcp-session-id"] as string
+  }
+
+  describe("idle session timeout", () => {
+    it("closes an idle session once sessionTimeoutMs elapses", async () => {
+      ;({ server } = await startServer({ sessionTimeoutMs: 50 }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      const sessionId = await initSession(port)
+      expect(server.getActiveSessions()).toContain(sessionId)
+
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      expect(server.getActiveSessions()).not.toContain(sessionId)
+    })
+
+    it("keeps a session open indefinitely when sessionTimeoutMs is explicitly 0", async () => {
+      ;({ server } = await startServer({ sessionTimeoutMs: 0 }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      const sessionId = await initSession(port)
+      expect(server.getActiveSessions()).toContain(sessionId)
+
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      expect(server.getActiveSessions()).toContain(sessionId)
+    })
+
+    it("defaults to a 1h timeout (not 'never') when unset", async () => {
+      ;({ server } = await startServer())
+      // @ts-expect-error private property access for test
+      expect(server.options.sessionTimeoutMs).toBe(3600000)
+    })
   })
 })
