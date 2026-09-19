@@ -1,6 +1,14 @@
 import { createCipheriv, randomBytes } from "crypto"
 import { describe, expect, it } from "vitest"
-import { decrypt, decryptJson, parseEncryptionKey } from "../../../src/riffado/crypto.js"
+import {
+  decrypt,
+  decryptJson,
+  IV_STAMP_PREFIX_LEN,
+  ivStampOf,
+  JSON_IV_STAMP_PREFIX_LEN,
+  jsonIvStampOf,
+  parseEncryptionKey,
+} from "../../../src/riffado/crypto.js"
 
 const KEY = parseEncryptionKey("a".repeat(64))
 const OTHER_KEY = parseEncryptionKey("b".repeat(64))
@@ -11,6 +19,14 @@ function encrypt(plain: string, key: Buffer): string {
   const ciphertext = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()])
   const tag = cipher.getAuthTag()
   return `v1:${iv.toString("hex")}:${tag.toString("hex")}:${ciphertext.toString("hex")}`
+}
+
+/** Postgres's jsonb::text cast always renders the `{"c": "<v1:...>"}` wrapper with exactly
+ * this spacing, regardless of how it was written -- verified against a real jsonb column
+ * (see crypto.ts's `JSON_WRAPPER_PREFIX`). Tests below construct that exact rendering
+ * directly, since these are pure-function unit tests with no real Postgres involved. */
+function pgJsonbWrapper(cipher: string): string {
+  return `{"c": "${cipher}"}`
 }
 
 describe("decrypt", () => {
@@ -76,5 +92,96 @@ describe("decryptJson", () => {
     const inner = JSON.stringify(["item one", "item two"])
     const wrapper = JSON.stringify({ c: encrypt(inner, KEY) })
     expect(decryptJson(wrapper, KEY)).toEqual(["item one", "item two"])
+  })
+})
+
+describe("ivStampOf", () => {
+  it("returns the IV segment for a v1: value, without decrypting", () => {
+    const value = encrypt("hallo welt", KEY)
+    const iv = value.split(":")[1]
+    expect(ivStampOf(value)).toBe(iv)
+  })
+
+  it("changes when the value is re-encrypted (fresh IV), even for identical plaintext", () => {
+    const a = encrypt("same text", KEY)
+    const b = encrypt("same text", KEY)
+    expect(ivStampOf(a)).not.toBe(ivStampOf(b))
+  })
+
+  it("stays equal across repeated calls on the same value", () => {
+    const value = encrypt("hallo welt", KEY)
+    expect(ivStampOf(value)).toBe(ivStampOf(value))
+  })
+
+  it("gives the identical result for the full value and just its IV_STAMP_PREFIX_LEN prefix -- the invariant RecordingStore's two-phase refresh depends on", () => {
+    const value = encrypt("hallo welt, this is a much longer plaintext than the others", KEY)
+    const prefix = value.slice(0, IV_STAMP_PREFIX_LEN)
+    expect(prefix.length).toBe(IV_STAMP_PREFIX_LEN)
+    expect(ivStampOf(prefix)).toBe(ivStampOf(value))
+  })
+
+  it("a legacy plaintext value never crashes, and never silently compares equal to itself (always-different marker, conservative rebuild)", () => {
+    expect(() => ivStampOf("Legacy Plaintext Title")).not.toThrow()
+    expect(ivStampOf("Legacy Plaintext Title")).not.toBe(ivStampOf("Legacy Plaintext Title"))
+  })
+
+  it("a malformed v1:-ish value never crashes, and never silently compares equal to itself", () => {
+    expect(() => ivStampOf("v1:deadbeef:cafebabe")).not.toThrow()
+    expect(ivStampOf("v1:deadbeef:cafebabe")).not.toBe(ivStampOf("v1:deadbeef:cafebabe"))
+  })
+
+  it("returns '' for empty/null/undefined, and never throws", () => {
+    expect(ivStampOf("")).toBe("")
+    expect(ivStampOf(null)).toBe("")
+    expect(ivStampOf(undefined)).toBe("")
+  })
+})
+
+describe("jsonIvStampOf", () => {
+  it('returns the wrapped ciphertext\'s IV segment for the canonical {"c": "v1:..."} shape', () => {
+    const inner = JSON.stringify(["a"])
+    const cipher = encrypt(inner, KEY)
+    const wrapper = pgJsonbWrapper(cipher)
+    expect(jsonIvStampOf(wrapper)).toBe(cipher.split(":")[1])
+  })
+
+  it("changes when the wrapped ciphertext is re-encrypted", () => {
+    const inner = JSON.stringify(["a"])
+    const wrapperA = pgJsonbWrapper(encrypt(inner, KEY))
+    const wrapperB = pgJsonbWrapper(encrypt(inner, KEY))
+    expect(jsonIvStampOf(wrapperA)).not.toBe(jsonIvStampOf(wrapperB))
+  })
+
+  it("gives the identical result for the full wrapper and just its JSON_IV_STAMP_PREFIX_LEN prefix", () => {
+    const inner = JSON.stringify(["a", "b", "c"])
+    const wrapper = pgJsonbWrapper(encrypt(inner, KEY))
+    const prefix = wrapper.slice(0, JSON_IV_STAMP_PREFIX_LEN)
+    expect(prefix.length).toBe(JSON_IV_STAMP_PREFIX_LEN)
+    expect(jsonIvStampOf(prefix)).toBe(jsonIvStampOf(wrapper))
+  })
+
+  it("a wrapper written without Postgres's canonical spacing (e.g. raw JSON.stringify output) is not recognized, and never crashes or silently compares equal to itself", () => {
+    const inner = JSON.stringify(["a"])
+    // No space after the key's colon -- what JSON.stringify produces directly, as opposed
+    // to what a real jsonb::text cast would render (see pgJsonbWrapper's doc comment).
+    const looseWrapper = JSON.stringify({ c: encrypt(inner, KEY) })
+    expect(() => jsonIvStampOf(looseWrapper)).not.toThrow()
+    expect(jsonIvStampOf(looseWrapper)).not.toBe(jsonIvStampOf(looseWrapper))
+  })
+
+  it("plain (unwrapped) jsonb never crashes, and never silently compares equal to itself", () => {
+    expect(() => jsonIvStampOf('["a","b"]')).not.toThrow()
+    expect(jsonIvStampOf('["a","b"]')).not.toBe(jsonIvStampOf('["a","b"]'))
+  })
+
+  it("non-JSON garbage never crashes, and never silently compares equal to itself", () => {
+    expect(() => jsonIvStampOf("not json at all")).not.toThrow()
+    expect(jsonIvStampOf("not json at all")).not.toBe(jsonIvStampOf("not json at all"))
+  })
+
+  it("returns '' for empty/null/undefined", () => {
+    expect(jsonIvStampOf("")).toBe("")
+    expect(jsonIvStampOf(null)).toBe("")
+    expect(jsonIvStampOf(undefined)).toBe("")
   })
 })

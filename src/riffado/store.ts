@@ -6,9 +6,25 @@
  * the expensive, not-always-needed part (search only needs it for the
  * stage-2 candidate set, `riffado_get_recording` only for one id at a
  * time) -- see `docs/architecture.md`.
+ *
+ * `refresh()` (the metadata reload behind `get()`/`getNormalizedFields()`)
+ * is itself two-phase -- not to be confused with the two-stage store/search
+ * split above. Phase 1 (`STAMP_QUERY`) is a cheap query for a per-recording
+ * change stamp only (IV prefixes, flags, ids -- never the full ciphertext).
+ * Phase 2 (`METADATA_QUERY`) fetches full metadata, `WHERE r.id = ANY($1)`,
+ * for only the ids phase 1 found new or changed; everything else is reused
+ * by reference from the previous refresh, no decrypt/normalize/re-transfer.
+ * See `docs/architecture.md`.
  */
 import type { Pool } from "pg"
-import { decrypt, decryptJson } from "./crypto.js"
+import {
+  decrypt,
+  decryptJson,
+  IV_STAMP_PREFIX_LEN,
+  ivStampOf,
+  JSON_IV_STAMP_PREFIX_LEN,
+  jsonIvStampOf,
+} from "./crypto.js"
 import { timestampToIsoUtc } from "./db.js"
 import { flattenListItem, formatDuration, titleOrFallback } from "./format.js"
 import { LruCache } from "./lru.js"
@@ -49,6 +65,43 @@ interface TranscriptRow {
   text: string | null
 }
 
+/** Phase-1 row: just enough to compute `stampFor()` -- prefixes, never the
+ * full ciphertext. See `STAMP_QUERY`. */
+interface StampRow {
+  id: string
+  is_trash: boolean
+  deleted_at: string | null
+  updated_at: string
+  transcript_id: string | null
+  source: string | null
+  filename_prefix: string | null
+  summary_prefix: string | null
+  key_points_prefix: string | null
+  action_items_prefix: string | null
+}
+
+// Phase 1 of refresh(): a cheap per-recording change stamp, without transferring any full
+// ciphertext. `left(..., N)` selects only as many leading characters as ivStampOf()/
+// jsonIvStampOf() ever look at (IV_STAMP_PREFIX_LEN/JSON_IV_STAMP_PREFIX_LEN, imported from
+// crypto.ts, which also documents why a prefix this long gives those functions the exact
+// same answer as the full value would) -- so this query moves roughly 200 bytes/recording
+// instead of the ~8KB/recording phase 2 (METADATA_QUERY, below) would. See stampFor() and
+// docs/architecture.md.
+const STAMP_QUERY = `
+SELECT r.id, r.is_trash, r.deleted_at, r.updated_at, t.id AS transcript_id, t.source,
+       left(r.filename, ${IV_STAMP_PREFIX_LEN}) AS filename_prefix,
+       left(e.summary, ${IV_STAMP_PREFIX_LEN}) AS summary_prefix,
+       left(e.key_points::text, ${JSON_IV_STAMP_PREFIX_LEN}) AS key_points_prefix,
+       left(e.action_items::text, ${JSON_IV_STAMP_PREFIX_LEN}) AS action_items_prefix
+FROM recordings r
+LEFT JOIN transcriptions t ON t.recording_id = r.id
+LEFT JOIN ai_enhancements e ON e.recording_id = r.id
+WHERE r.deleted_at IS NULL AND NOT r.is_trash`
+
+// Phase 2 of refresh(): full metadata (title/summary/key points/action items/transcript
+// descriptors), for exactly the ids phase 1 found new or changed -- `AND r.id = ANY($1)`
+// is always present, never run for the whole corpus at once (see refresh()).
+//
 // key_points/action_items are cast to text: see decryptJson()'s doc comment.
 //
 // text_length estimates the decrypted character count from the ciphertext's hex length
@@ -73,7 +126,7 @@ SELECT r.id, r.user_id, r.filename, r.duration, r.start_time,
 FROM recordings r
 LEFT JOIN transcriptions t ON t.recording_id = r.id
 LEFT JOIN ai_enhancements e ON e.recording_id = r.id
-WHERE r.deleted_at IS NULL AND NOT r.is_trash`
+WHERE r.deleted_at IS NULL AND NOT r.is_trash AND r.id = ANY($1)`
 
 // Joins back to recordings (not just a bare `WHERE recording_id = ANY($1)`) so a stray or
 // spoofed id can't pull another user's/a trashed/a deleted recording's transcript text.
@@ -84,8 +137,13 @@ JOIN recordings r ON r.id = t.recording_id
 WHERE t.recording_id = ANY($1) AND r.deleted_at IS NULL AND NOT r.is_trash`
 
 interface Snapshot {
+  /** Public contract: same order every caller sees (`startedAt` descending). */
   recordings: Recording[]
+  /** Same recordings, by id -- for O(1) reuse lookups on the next refresh. */
+  recordingsById: Map<string, Recording>
   normalizedFieldsById: Map<string, NormalizedCheapFields>
+  /** Per-recording change stamp this snapshot was built with -- see `stampFor()`. */
+  stampsById: Map<string, string>
 }
 
 export class RecordingStore {
@@ -199,54 +257,148 @@ export class RecordingStore {
     return result
   }
 
+  /**
+   * Two-phase refresh -- see the file header and `docs/architecture.md`.
+   *
+   * Phase 1 (`STAMP_QUERY`) computes every current recording's change stamp
+   * cheaply (IV prefixes, flags, transcript ids -- never full ciphertext)
+   * and, by comparing each one to the previous refresh's stamp for that id
+   * (`previous.stampsById`), decides which ids are new or changed.
+   *
+   * Phase 2 (`METADATA_QUERY`, `WHERE r.id = ANY($1)`) fetches full metadata
+   * -- and only now touches any ciphertext -- for exactly those ids, and is
+   * skipped entirely when nothing changed. Every other id is carried
+   * forward from `previous` **by reference**: no decrypt, no
+   * re-normalize. A recording that no longer appears in phase 1's results
+   * (trashed, deleted, or gone) is simply not carried forward; one that
+   * disappears between phase 1 and phase 2 (a rare race, e.g. deleted
+   * mid-refresh) is dropped the same way, not left half-built.
+   *
+   * The very first refresh (`this.cache` still `null` -- a cold start, or
+   * right after `invalidate()`, which drops the stamps along with
+   * everything else) has nothing to compare phase 1's stamps against, so
+   * every id counts as changed and phase 2 fetches the whole corpus --
+   * functionally the old single-query refresh, plus phase 1's cheap round
+   * trip.
+   */
   private async refresh(): Promise<Snapshot> {
     const start = Date.now()
-    const params: string[] = []
-    let query = METADATA_QUERY
+    const previous = this.cache
+
+    const stampParams: string[] = []
+    let stampQuery = STAMP_QUERY
     if (this.userId) {
-      params.push(this.userId)
-      query += ` AND r.user_id = $${params.length}`
+      stampParams.push(this.userId)
+      stampQuery += ` AND r.user_id = $${stampParams.length}`
     }
-    query += " ORDER BY r.start_time DESC"
+    stampQuery += " ORDER BY r.start_time DESC"
+    const stampResult = await this.pool.query<StampRow>(stampQuery, stampParams)
 
-    const result = await this.pool.query<MetaRow>(query, params)
-    const recordings = this.buildRecordings(result.rows)
-    const normalizedFieldsById = new Map<string, NormalizedCheapFields>()
-    for (const rec of recordings) {
-      normalizedFieldsById.set(rec.id, normalizedCheapFieldsFor(rec))
-    }
-    console.error(
-      `[riffado-mcp] store refreshed: ${recordings.length} recording(s) from ${result.rows.length} row(s) in ${Date.now() - start}ms`,
-    )
-    return { recordings, normalizedFieldsById }
-  }
-
-  private buildRecordings(rows: MetaRow[]): Recording[] {
-    const byId = new Map<string, Recording>()
+    // Group phase-1 rows by recording id, preserving first-seen order -- the query's ORDER
+    // BY (startedAt descending) already puts them in the order the public `recordings`
+    // array must keep, regardless of which ids end up reused vs. rebuilt below.
+    const stampRowsById = new Map<string, StampRow[]>()
     const order: string[] = []
-
-    for (const row of rows) {
-      let rec = byId.get(row.id)
-      if (!rec) {
-        const durationMs = row.duration ?? 0
-        const summary = row.summary ? decrypt(row.summary, this.encryptionKey) : ""
-        rec = {
-          id: row.id,
-          userId: row.user_id,
-          title: titleOrFallback(decrypt(row.filename, this.encryptionKey), row.id),
-          startedAt: timestampToIsoUtc(row.start_time),
-          durationMs,
-          duration: formatDuration(durationMs),
-          summary: summary || undefined,
-          keyPoints: decryptJson(row.key_points, this.encryptionKey).map(flattenListItem),
-          actionItems: decryptJson(row.action_items, this.encryptionKey).map(flattenListItem),
-          transcripts: [],
-          url: this.appUrl ? `${this.appUrl.replace(/\/+$/, "")}/recordings/${row.id}` : undefined,
-        }
-        byId.set(row.id, rec)
+    for (const row of stampResult.rows) {
+      const group = stampRowsById.get(row.id)
+      if (group) {
+        group.push(row)
+      } else {
+        stampRowsById.set(row.id, [row])
         order.push(row.id)
       }
+    }
 
+    const stampsById = new Map<string, string>()
+    const toFetch: string[] = []
+    for (const id of order) {
+      const stamp = this.stampFor(stampRowsById.get(id)!)
+      stampsById.set(id, stamp)
+      if (!previous || previous.stampsById.get(id) !== stamp) {
+        toFetch.push(id)
+      }
+    }
+
+    const rebuiltById = new Map<string, Recording>()
+    if (toFetch.length > 0) {
+      const params: unknown[] = [toFetch]
+      let query = METADATA_QUERY
+      if (this.userId) {
+        params.push(this.userId)
+        query += ` AND r.user_id = $${params.length}`
+      }
+      query += " ORDER BY r.start_time DESC"
+      const result = await this.pool.query<MetaRow>(query, params)
+
+      const rowsById = new Map<string, MetaRow[]>()
+      for (const row of result.rows) {
+        const group = rowsById.get(row.id)
+        if (group) {
+          group.push(row)
+        } else {
+          rowsById.set(row.id, [row])
+        }
+      }
+      for (const [id, rows] of rowsById) {
+        rebuiltById.set(id, this.buildRecording(rows))
+      }
+    }
+
+    const recordings: Recording[] = []
+    const recordingsById = new Map<string, Recording>()
+    const normalizedFieldsById = new Map<string, NormalizedCheapFields>()
+    let reused = 0
+
+    for (const id of order) {
+      const rebuilt = rebuiltById.get(id)
+      let rec: Recording | undefined
+      let normalized: NormalizedCheapFields | undefined
+      if (rebuilt) {
+        rec = rebuilt
+        normalized = normalizedCheapFieldsFor(rec)
+      } else {
+        rec = previous?.recordingsById.get(id)
+        normalized = previous?.normalizedFieldsById.get(id)
+        if (rec && normalized) {
+          reused++
+        }
+      }
+      if (!rec || !normalized) {
+        continue // vanished between phase 1 and phase 2 -- drop it, same as any other absence
+      }
+      recordings.push(rec)
+      recordingsById.set(id, rec)
+      normalizedFieldsById.set(id, normalized)
+    }
+
+    console.error(
+      `[riffado-mcp] store refreshed: ${recordings.length} recording(s), ${toFetch.length} ` +
+        `fetched (${reused} reused unchanged) in ${Date.now() - start}ms`,
+    )
+    return { recordings, recordingsById, normalizedFieldsById, stampsById }
+  }
+
+  /** Decrypts + normalizes one recording from its own metadata-query rows
+   * (one row per transcript source, at least one row even with none). */
+  private buildRecording(rows: MetaRow[]): Recording {
+    const first = rows[0]
+    const durationMs = first.duration ?? 0
+    const summary = first.summary ? decrypt(first.summary, this.encryptionKey) : ""
+    const rec: Recording = {
+      id: first.id,
+      userId: first.user_id,
+      title: titleOrFallback(decrypt(first.filename, this.encryptionKey), first.id),
+      startedAt: timestampToIsoUtc(first.start_time),
+      durationMs,
+      duration: formatDuration(durationMs),
+      summary: summary || undefined,
+      keyPoints: decryptJson(first.key_points, this.encryptionKey).map(flattenListItem),
+      actionItems: decryptJson(first.action_items, this.encryptionKey).map(flattenListItem),
+      transcripts: [],
+      url: this.appUrl ? `${this.appUrl.replace(/\/+$/, "")}/recordings/${first.id}` : undefined,
+    }
+
+    for (const row of rows) {
       if (row.source) {
         const descriptor: TranscriptDescriptor = {
           source: row.source,
@@ -259,6 +411,39 @@ export class RecordingStore {
       }
     }
 
-    return order.map((id) => byId.get(id)!)
+    return rec
+  }
+
+  /**
+   * Cheap per-recording change stamp, built from phase 1's prefix-only
+   * rows -- no decryption, and (thanks to `ivStampOf`/`jsonIvStampOf` only
+   * ever looking at a fixed-length prefix, see their doc comments) no need
+   * for the full ciphertext either. Built from: the IV segment of each
+   * encrypted field (any re-encryption draws a fresh IV, so a changed IV
+   * always means changed content), `is_trash`/`deleted_at`/`updated_at`,
+   * and the set of transcript `(id, source)` pairs with their count (so an
+   * added or removed transcript source is caught even though nothing else
+   * on the recording changed). Equal stamps across two refreshes are the
+   * signal that lets `refresh()` reuse the previous cache entry verbatim,
+   * skipping phase 2 for that recording entirely.
+   */
+  private stampFor(rows: StampRow[]): string {
+    const first = rows[0]
+    const transcriptIds = rows
+      .filter((r) => r.transcript_id !== null)
+      .map((r) => `${r.transcript_id}:${r.source}`)
+      .sort()
+
+    return JSON.stringify([
+      ivStampOf(first.filename_prefix),
+      ivStampOf(first.summary_prefix),
+      jsonIvStampOf(first.key_points_prefix),
+      jsonIvStampOf(first.action_items_prefix),
+      first.is_trash,
+      first.deleted_at,
+      first.updated_at,
+      transcriptIds.length,
+      transcriptIds,
+    ])
   }
 }
