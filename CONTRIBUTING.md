@@ -44,7 +44,8 @@ These are load-bearing, and each one is a bug that was already paid for once:
    why `dotenv` is configured with `quiet: true`) corrupts every message. Log
    to stderr.
 3. **Decrypted content never touches disk.** Recordings are decrypted into the
-   in-memory `RecordingStore` only.
+   in-memory `RecordingStore` only -- metadata in its refresh cache, transcript
+   text in its on-demand LRU (`getTranscripts`). Neither is ever written out.
 4. **Search stays in-process.** The database only ever holds ciphertext, so
    there is nothing to index in SQL — see
    [`docs/architecture.md`](./docs/architecture.md).

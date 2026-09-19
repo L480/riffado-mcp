@@ -12,13 +12,33 @@ over MCP — stdio for Claude Code, Streamable HTTP + OAuth for Claude Web/iOS.
 
 ## Tools
 
-| Tool                        | What it does                                                                                                                                   |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `riffado_list_recordings`   | List recordings (newest first by default), with title, date, duration, transcript sources, optional summary snippet.                           |
-| `riffado_search`            | Full-text search over transcripts/summaries/key points/action items — runs in-process (the DB only holds ciphertext), ranked by term coverage. |
-| `riffado_get_recording`     | Full detail for one recording: metadata, summary, key points, action items, a pageable transcript slice.                                       |
-| `riffado_list_action_items` | Flattened action items across recordings, each tagged with its source recording.                                                               |
-| `riffado_stats`             | Recording count, total/median duration, first/last date, transcripts per source/provider, coverage gaps.                                       |
+| Tool                        | What it does                                                                                                                                                                      |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `riffado_list_recordings`   | List recordings (newest first by default), with title, date, duration, transcript sources, optional summary snippet.                                                              |
+| `riffado_search`            | Two-stage search over titles/summaries/key points/action items, then transcripts, in-process (the DB only holds ciphertext). `deep: true` widens transcript scanning — see below. |
+| `riffado_get_recording`     | Full detail for one recording: metadata, summary, key points, action items, a pageable transcript slice (fetched on demand).                                                      |
+| `riffado_list_action_items` | Flattened action items across recordings, each tagged with its source recording.                                                                                                  |
+| `riffado_stats`             | Recording count, total/median duration, first/last date, transcripts per source/provider, coverage gaps.                                                                          |
+
+### `riffado_search`: two-stage, and the `deep` parameter
+
+Search runs in two stages. **Stage 1** scores the whole corpus against
+pre-normalized titles/summaries/key points/action items only (cheap, always
+in memory). **Stage 2** fetches and scans transcript text, but only for the
+top-ranked stage-1 candidates (`K = min(max(limit * 3, 30), 200)`) — not the
+whole corpus. `scope: "summary"` stops after stage 1 (no transcript fetch
+at all); `scope: "all"` (default) and `scope: "transcript"` run stage 2 over
+the candidate set.
+
+This means a term that appears **only** in one recording's transcript, and
+nowhere in any title/summary/key point/action item, may not surface unless
+that recording happens to rank in the top-K by cheap-field score. Pass
+**`deep: true`** to scan every recording's transcript that passes the
+`from`/`to` date filter instead of just the candidates — slower, and its
+cost scales with corpus size, so combine it with `from`/`to` when possible.
+The tool's response says explicitly when results were narrowed this way
+(i.e. whenever `deep` is `false`), so a client can tell a no-hit result from
+a real absence rather than assume one.
 
 Also: resource `riffado://index` (markdown index), resource template
 `riffado://recording/{id}`, and prompt `riffado_ask` (carries the answering
@@ -129,6 +149,20 @@ TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5433/riffado_test \
   npm run test:integration
 docker compose -f docker-compose.test.yml down
 ```
+
+## Memory & performance characteristics
+
+`RecordingStore.get()` returns metadata only (title, summary, key points,
+action items, transcript _descriptors_ — no text), refreshed and cached for
+`CACHE_TTL_MS`. Transcript text is fetched on demand via
+`getTranscripts(recordingIds)` — one batched query for exactly the ids that
+need it, decrypted, served from a small LRU (`transcriptCacheSize`, default
+~50 recordings). Memory now scales with the cheap fields (summaries, key
+points, titles), not with the full decrypted transcript corpus.
+
+See the [`v0.1.0` release notes](https://github.com/L480/riffado-mcp/releases/tag/v0.1.0)
+for measured before/after numbers (search latency and RSS delta at
+N=1000/5000/20000 recordings).
 
 ## Security notes
 
