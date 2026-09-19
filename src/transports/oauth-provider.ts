@@ -7,6 +7,7 @@
 import { Response } from "express"
 import { randomUUID, randomBytes, timingSafeEqual } from "crypto"
 import fs from "fs"
+import path from "path"
 import type {
   OAuthServerProvider,
   AuthorizationParams,
@@ -45,6 +46,14 @@ export interface StaticTokenOAuthOptions {
    * before a restart simply has to be retried.
    */
   stateFile?: string
+  /**
+   * Maximum number of registered clients kept at once (default: 100).
+   * `/register` is unauthenticated per the MCP DCR spec, so without a cap
+   * an anonymous caller could grow the in-memory map — and the on-disk
+   * state file `persistState` rewrites on every registration — without
+   * bound. Once at capacity, the oldest client is evicted to make room.
+   */
+  maxClients?: number
 }
 
 interface PersistedState {
@@ -102,6 +111,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   private readonly authorizationCodeTtlSeconds: number
   private readonly serverName: string
   private readonly stateFile?: string
+  private readonly maxClients: number
 
   private readonly clients = new Map<string, OAuthClientInformationFull>()
   private readonly authorizationCodes = new Map<string, StoredAuthorizationCode>()
@@ -116,12 +126,16 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     this.authorizationCodeTtlSeconds = options.authorizationCodeTtlSeconds ?? 5 * 60
     this.serverName = options.serverName ?? "Riffado MCP"
     this.stateFile = options.stateFile
+    this.maxClients = options.maxClients ?? 100
     this.loadState()
   }
 
   public readonly clientsStore: OAuthRegisteredClientsStore = {
     getClient: (clientId: string) => this.clients.get(clientId),
     registerClient: (client) => {
+      if (this.clients.size >= this.maxClients) {
+        this.evictOldestClient()
+      }
       const clientId = randomUUID()
       const full: OAuthClientInformationFull = {
         ...client,
@@ -132,6 +146,41 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       this.persistState()
       return full
     },
+  }
+
+  /**
+   * Evicts the single oldest registered client to make room under
+   * `maxClients`. Picked by `client_id_issued_at` rather than relying on
+   * `Map` insertion order — the two agree in practice (insertion order is
+   * issuance order here, including after a state-file reload, since that
+   * reload replays the persisted array in order), but issued_at is the
+   * actual source of truth and the lookup is O(maxClients), cheap at this
+   * cap size.
+   *
+   * Deliberately does NOT touch `accessTokens`/`refreshTokens` belonging to
+   * the evicted client: `verifyAccessToken`/`getValidAccessToken` never
+   * check that a token's client still exists, only that the token itself
+   * is known and unexpired, and `revokeToken` already deletes tokens
+   * independently of the client registry. So an evicted client's
+   * previously issued tokens simply keep working until their own TTL
+   * expires — consistent with how tokens already behave everywhere else in
+   * this provider, and correct because eviction here is a registry-size
+   * safeguard against unbounded `/register` growth, not a revocation
+   * mechanism.
+   */
+  private evictOldestClient(): void {
+    let oldestId: string | undefined
+    let oldestIssuedAt = Infinity
+    for (const [id, client] of this.clients) {
+      const issuedAt = client.client_id_issued_at ?? 0
+      if (issuedAt < oldestIssuedAt) {
+        oldestIssuedAt = issuedAt
+        oldestId = id
+      }
+    }
+    if (oldestId !== undefined) {
+      this.clients.delete(oldestId)
+    }
   }
 
   /**
@@ -185,6 +234,15 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * a write failure is logged but never surfaced to the caller, since
    * losing persistence should not break the OAuth flow that just
    * succeeded in memory.
+   *
+   * The file holds plaintext 30-day bearer/refresh tokens, so it must land
+   * at 0600, and a crash mid-write must not corrupt existing state. Both
+   * come from writing a uniquely-named temp file (mode set at creation —
+   * `writeFileSync`'s `mode` option is only applied when the file doesn't
+   * already exist yet, so writing in place over the target, or over a
+   * reused temp filename, would silently keep whatever permissions were
+   * already there) and `renameSync`-ing it over the target, which is
+   * atomic on the same filesystem.
    */
   private persistState(): void {
     if (!this.stateFile) {
@@ -197,9 +255,20 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       refreshTokens: Array.from(this.refreshTokens.entries()),
     }
 
+    const tmpFile = path.join(
+      path.dirname(this.stateFile),
+      `.${path.basename(this.stateFile)}.${randomUUID()}.tmp`,
+    )
+
     try {
-      fs.writeFileSync(this.stateFile, JSON.stringify(state))
+      fs.writeFileSync(tmpFile, JSON.stringify(state), { mode: 0o600 })
+      fs.renameSync(tmpFile, this.stateFile)
     } catch (error) {
+      try {
+        fs.unlinkSync(tmpFile)
+      } catch {
+        // best-effort cleanup of the temp file; the error below is what matters
+      }
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Failed to persist OAuth state to ${this.stateFile}: ${message}`)
     }
