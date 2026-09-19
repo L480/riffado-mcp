@@ -4,7 +4,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import { registerRiffadoResources } from "../../../src/resources/index.js"
 import type { RecordingStore } from "../../../src/riffado/store.js"
-import type { Recording } from "../../../src/riffado/types.js"
+import type { Recording, TranscriptText } from "../../../src/riffado/types.js"
 
 const FIXTURES: Recording[] = [
   {
@@ -17,14 +17,25 @@ const FIXTURES: Recording[] = [
     summary: "A short summary.",
     keyPoints: [],
     actionItems: [],
-    transcripts: [
-      { source: "riffado", provider: "openai", model: "whisper-1", text: "hello world" },
-    ],
+    transcripts: [{ source: "riffado", provider: "openai", model: "whisper-1", textLength: 11 }],
   },
 ]
 
+const TRANSCRIPT_TEXTS = new Map<string, TranscriptText[]>([
+  ["rec-1", [{ source: "riffado", text: "hello world" }]],
+])
+
 function fakeStore(recordings: Recording[]): RecordingStore {
-  return { get: async () => recordings } as unknown as RecordingStore
+  return {
+    get: async () => recordings,
+    getTranscripts: async (ids: string[]) => {
+      const result = new Map<string, TranscriptText[]>()
+      for (const id of ids) {
+        result.set(id, TRANSCRIPT_TEXTS.get(id) ?? [])
+      }
+      return result
+    },
+  } as unknown as RecordingStore
 }
 
 describe("riffado resources", () => {

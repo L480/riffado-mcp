@@ -9,7 +9,7 @@
  * Postgres level, not just in application code.
  */
 import pg from "pg"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { createPool } from "../../src/riffado/db.js"
 import { parseEncryptionKey } from "../../src/riffado/crypto.js"
 import { RecordingStore } from "../../src/riffado/store.js"
@@ -66,17 +66,36 @@ describe.skipIf(!TEST_DATABASE_URL)("RecordingStore against a real Postgres", ()
     expect(ids).not.toContain("rec-deleted")
   })
 
-  it("groups several transcript sources onto one recording", async () => {
+  it("groups several transcript sources onto one recording, as descriptors without text", async () => {
     const recordings = await store.get()
     const active = recordings.find((r) => r.id === "rec-active")
     const sources = active!.transcripts.map((t) => t.source).sort()
     expect(sources).toEqual(["manual", "riffado"])
-    expect(active!.transcripts.find((t) => t.source === "riffado")!.text).toBe(
+    for (const t of active!.transcripts) {
+      expect(t).not.toHaveProperty("text")
+      expect(typeof t.textLength).toBe("number")
+      expect(t.textLength).toBeGreaterThan(0)
+    }
+  })
+
+  it("getTranscripts decrypts text for requested ids in one query, keyed by recording id + source", async () => {
+    const querySpy = vi.spyOn(pool, "query")
+    const byId = await store.getTranscripts(["rec-active"])
+    expect(querySpy).toHaveBeenCalledTimes(1)
+    querySpy.mockRestore()
+
+    const texts = byId.get("rec-active")!
+    expect(texts.find((t) => t.source === "riffado")!.text).toBe(
       "Wir sprechen heute über die Kita-Übergabe.",
     )
-    expect(active!.transcripts.find((t) => t.source === "manual")!.text).toBe(
-      "Manuell nachgetragene Notizen.",
-    )
+    expect(texts.find((t) => t.source === "manual")!.text).toBe("Manuell nachgetragene Notizen.")
+  })
+
+  it("getTranscripts never returns a trashed or deleted recording's text, even if asked by id", async () => {
+    const byId = await store.getTranscripts(["rec-active", "rec-trashed", "rec-deleted"])
+    expect(byId.get("rec-trashed")).toEqual([])
+    expect(byId.get("rec-deleted")).toEqual([])
+    expect(byId.get("rec-active")!.length).toBeGreaterThan(0)
   })
 
   it("passes a legacy unencrypted filename through unchanged", async () => {

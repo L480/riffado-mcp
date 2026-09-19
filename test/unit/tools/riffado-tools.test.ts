@@ -1,13 +1,29 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { registerRiffadoTools } from "../../../src/tools/riffado-tools.js"
+import { computeCandidateK, normalizedCheapFieldsFor } from "../../../src/riffado/search.js"
 import type { RecordingStore } from "../../../src/riffado/store.js"
-import type { Recording } from "../../../src/riffado/types.js"
+import type { Recording, TranscriptText } from "../../../src/riffado/types.js"
 
-function fakeStore(recordings: Recording[]): RecordingStore {
-  return { get: async () => recordings } as unknown as RecordingStore
+function fakeStore(
+  recordings: Recording[],
+  transcriptTexts: Map<string, TranscriptText[]> = new Map(),
+): RecordingStore & { getTranscripts: ReturnType<typeof vi.fn> } {
+  const normalizedFieldsById = new Map(recordings.map((r) => [r.id, normalizedCheapFieldsFor(r)]))
+  const getTranscripts = vi.fn(async (ids: string[]) => {
+    const result = new Map<string, TranscriptText[]>()
+    for (const id of ids) {
+      result.set(id, transcriptTexts.get(id) ?? [])
+    }
+    return result
+  })
+  return {
+    get: async () => recordings,
+    getNormalizedFields: async () => normalizedFieldsById,
+    getTranscripts,
+  } as unknown as RecordingStore & { getTranscripts: ReturnType<typeof vi.fn> }
 }
 
 const FIXTURES: Recording[] = [
@@ -22,13 +38,7 @@ const FIXTURES: Recording[] = [
     keyPoints: ["Neue Erzieherin ab Oktober", "Eingewöhnung startet Montag"],
     actionItems: ["Nico — Formular unterschreiben"],
     transcripts: [
-      {
-        source: "riffado",
-        provider: "openai",
-        model: "whisper-1",
-        language: "de",
-        text: "Wir sprechen heute über die Kita-Übergabe und die neue Erzieherin.",
-      },
+      { source: "riffado", provider: "openai", model: "whisper-1", language: "de", textLength: 67 },
     ],
     url: "https://riffado.example.com/recordings/rec-3",
   },
@@ -43,20 +53,8 @@ const FIXTURES: Recording[] = [
     keyPoints: ["Pumpentausch notwendig"],
     actionItems: [],
     transcripts: [
-      {
-        source: "riffado",
-        provider: "openai",
-        model: "whisper-1",
-        language: "de",
-        text: "Das Angebot für die Heizung liegt bei dreitausend Euro.",
-      },
-      {
-        source: "manual",
-        provider: "human",
-        model: "n/a",
-        language: "de",
-        text: "Manuell nachgetragene Notizen zur Heizung.",
-      },
+      { source: "riffado", provider: "openai", model: "whisper-1", language: "de", textLength: 56 },
+      { source: "manual", provider: "human", model: "n/a", language: "de", textLength: 42 },
     ],
   },
   {
@@ -74,6 +72,25 @@ const FIXTURES: Recording[] = [
 // keyPoints/actionItems are already flattened to strings by the store, so
 // fixtures here use plain strings too.
 
+const TRANSCRIPT_TEXTS = new Map<string, TranscriptText[]>([
+  [
+    "rec-3",
+    [
+      {
+        source: "riffado",
+        text: "Wir sprechen heute über die Kita-Übergabe und die neue Erzieherin.",
+      },
+    ],
+  ],
+  [
+    "rec-2",
+    [
+      { source: "riffado", text: "Das Angebot für die Heizung liegt bei dreitausend Euro." },
+      { source: "manual", text: "Manuell nachgetragene Notizen zur Heizung." },
+    ],
+  ],
+])
+
 async function connect(store: RecordingStore) {
   const server = new McpServer({ name: "test", version: "0.0.0" }, { capabilities: { tools: {} } })
   registerRiffadoTools(server, store)
@@ -86,9 +103,11 @@ async function connect(store: RecordingStore) {
 describe("riffado_list_recordings", () => {
   let client: Client
   let server: McpServer
+  let store: ReturnType<typeof fakeStore>
 
   beforeEach(async () => {
-    ;({ client, server } = await connect(fakeStore(FIXTURES)))
+    store = fakeStore(FIXTURES)
+    ;({ client, server } = await connect(store))
   })
   afterEach(async () => {
     await client.close()
@@ -139,21 +158,28 @@ describe("riffado_list_recordings", () => {
     const text = (result.content as { type: string; text: string }[])[0].text
     expect(text).toContain("rec-1")
   })
+
+  it("never calls getTranscripts -- metadata only", async () => {
+    await client.callTool({ name: "riffado_list_recordings", arguments: {} })
+    expect(store.getTranscripts).not.toHaveBeenCalled()
+  })
 })
 
 describe("riffado_search", () => {
   let client: Client
   let server: McpServer
+  let store: ReturnType<typeof fakeStore>
 
   beforeEach(async () => {
-    ;({ client, server } = await connect(fakeStore(FIXTURES)))
+    store = fakeStore(FIXTURES, TRANSCRIPT_TEXTS)
+    ;({ client, server } = await connect(store))
   })
   afterEach(async () => {
     await client.close()
     await server.close()
   })
 
-  it("finds a German term in the transcript", async () => {
+  it("finds a German term that is only in the transcript (two-stage, small corpus is fully candidate)", async () => {
     const result = await client.callTool({
       name: "riffado_search",
       arguments: { query: "Erzieherin" },
@@ -182,14 +208,112 @@ describe("riffado_search", () => {
     const structured = result.structuredContent as { hits: { id: string }[] }
     expect(structured.hits.map((h) => h.id)).toEqual(["rec-2"])
   })
+
+  it("scope: summary never fetches transcripts", async () => {
+    await client.callTool({
+      name: "riffado_search",
+      arguments: { query: "Angebot", scope: "summary" },
+    })
+    expect(store.getTranscripts).not.toHaveBeenCalled()
+  })
+
+  it("scope: all fetches transcripts only for the stage-1 candidate set", async () => {
+    await client.callTool({ name: "riffado_search", arguments: { query: "Angebot" } })
+    expect(store.getTranscripts).toHaveBeenCalledTimes(1)
+  })
+
+  it("default response notes the recall narrowing when deep is false", async () => {
+    const result = await client.callTool({
+      name: "riffado_search",
+      arguments: { query: "Erzieherin" },
+    })
+    const text = (result.content as { type: string; text: string }[])[0].text
+    expect(text.toLowerCase()).toContain("deep: true")
+  })
+
+  it("deep: true omits the narrowing note", async () => {
+    const result = await client.callTool({
+      name: "riffado_search",
+      arguments: { query: "Erzieherin", deep: true },
+    })
+    const text = (result.content as { type: string; text: string }[])[0].text
+    expect(text.toLowerCase()).not.toContain("deep: true")
+  })
+})
+
+describe("riffado_search: deep vs. shallow candidate narrowing", () => {
+  // K = computeCandidateK(limit); with a corpus larger than K, some recordings never
+  // become stage-1 candidates when their cheap fields don't match anything, so their
+  // transcripts are only scanned under deep: true.
+  const limit = 5
+  const k = computeCandidateK(limit)
+  const filler: Recording[] = Array.from({ length: k }, (_, i) => ({
+    id: `filler-${i}`,
+    userId: "u1",
+    title: "Filler recording",
+    startedAt: `2026-01-${String((i % 27) + 1).padStart(2, "0")}T00:00:00.000Z`,
+    durationMs: 1000,
+    duration: "0:00:01",
+    keyPoints: [],
+    actionItems: [],
+    transcripts: [{ source: "riffado", provider: "p", model: "m", textLength: 20 }],
+  }))
+  const needle: Recording = {
+    id: "needle",
+    userId: "u1",
+    title: "Also filler",
+    startedAt: "2025-01-01T00:00:00.000Z",
+    durationMs: 1000,
+    duration: "0:00:01",
+    keyPoints: [],
+    actionItems: [],
+    transcripts: [{ source: "riffado", provider: "p", model: "m", textLength: 40 }],
+  }
+  const corpus = [...filler, needle] // needle ranks last: filler count == K, all tied at score 0
+
+  const transcriptTexts = new Map<string, TranscriptText[]>([
+    ...filler.map((r): [string, TranscriptText[]] => [
+      r.id,
+      [{ source: "riffado", text: "nothing interesting here" }],
+    ]),
+    ["needle", [{ source: "riffado", text: "the term zzzuniqueneedle is right here" }]],
+  ])
+
+  it("deep: false does not find a term that is only in a non-candidate's transcript", async () => {
+    const store = fakeStore(corpus, transcriptTexts)
+    const { client, server } = await connect(store)
+    const result = await client.callTool({
+      name: "riffado_search",
+      arguments: { query: "zzzuniqueneedle", limit },
+    })
+    const structured = result.structuredContent as { hits: unknown[] }
+    expect(structured.hits).toEqual([])
+    await client.close()
+    await server.close()
+  })
+
+  it("deep: true finds it", async () => {
+    const store = fakeStore(corpus, transcriptTexts)
+    const { client, server } = await connect(store)
+    const result = await client.callTool({
+      name: "riffado_search",
+      arguments: { query: "zzzuniqueneedle", limit, deep: true },
+    })
+    const structured = result.structuredContent as { hits: { id: string }[] }
+    expect(structured.hits.map((h) => h.id)).toEqual(["needle"])
+    await client.close()
+    await server.close()
+  })
 })
 
 describe("riffado_get_recording", () => {
   let client: Client
   let server: McpServer
+  let store: ReturnType<typeof fakeStore>
 
   beforeEach(async () => {
-    ;({ client, server } = await connect(fakeStore(FIXTURES)))
+    store = fakeStore(FIXTURES, TRANSCRIPT_TEXTS)
+    ;({ client, server } = await connect(store))
   })
   afterEach(async () => {
     await client.close()
@@ -204,6 +328,12 @@ describe("riffado_get_recording", () => {
     const structured = result.structuredContent as { id: string; summary: string }
     expect(structured.id).toBe("rec-3")
     expect(structured.summary).toContain("Kita-Übergabe")
+  })
+
+  it("fetches the transcript on demand, for that one recording only", async () => {
+    await client.callTool({ name: "riffado_get_recording", arguments: { id: "rec-3" } })
+    expect(store.getTranscripts).toHaveBeenCalledTimes(1)
+    expect(store.getTranscripts).toHaveBeenCalledWith(["rec-3"])
   })
 
   it("is an error result for an unknown id", async () => {
@@ -245,18 +375,29 @@ describe("riffado_get_recording", () => {
 
 describe("riffado_list_action_items", () => {
   it("flattens action items with their source recording", async () => {
-    const { client, server } = await connect(fakeStore(FIXTURES))
+    const store = fakeStore(FIXTURES)
+    const { client, server } = await connect(store)
     const result = await client.callTool({ name: "riffado_list_action_items", arguments: {} })
     const structured = result.structuredContent as { items: { recordingId: string }[] }
     expect(structured.items.some((i) => i.recordingId === "rec-3")).toBe(true)
     await client.close()
     await server.close()
   })
+
+  it("never calls getTranscripts -- metadata only", async () => {
+    const store = fakeStore(FIXTURES)
+    const { client, server } = await connect(store)
+    await client.callTool({ name: "riffado_list_action_items", arguments: {} })
+    expect(store.getTranscripts).not.toHaveBeenCalled()
+    await client.close()
+    await server.close()
+  })
 })
 
 describe("riffado_stats", () => {
-  it("computes counts and coverage gaps", async () => {
-    const { client, server } = await connect(fakeStore(FIXTURES))
+  it("computes counts and coverage gaps from descriptors", async () => {
+    const store = fakeStore(FIXTURES)
+    const { client, server } = await connect(store)
     const result = await client.callTool({ name: "riffado_stats", arguments: {} })
     const structured = result.structuredContent as {
       count: number
@@ -266,6 +407,15 @@ describe("riffado_stats", () => {
     expect(structured.count).toBe(3)
     expect(structured.withoutTranscript).toBe(1)
     expect(structured.withoutSummary).toBe(1)
+    await client.close()
+    await server.close()
+  })
+
+  it("never calls getTranscripts -- metadata only", async () => {
+    const store = fakeStore(FIXTURES)
+    const { client, server } = await connect(store)
+    await client.callTool({ name: "riffado_stats", arguments: {} })
+    expect(store.getTranscripts).not.toHaveBeenCalled()
     await client.close()
     await server.close()
   })

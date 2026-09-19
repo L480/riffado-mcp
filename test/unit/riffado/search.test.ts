@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from "vitest"
-import { normalize, parseQueryTerms, searchRecordings } from "../../../src/riffado/search.js"
-import type { Recording } from "../../../src/riffado/types.js"
+import {
+  computeCandidateK,
+  finalizeSearch,
+  normalize,
+  normalizedCheapFieldsFor,
+  parseQueryTerms,
+  rankByCheapFields,
+} from "../../../src/riffado/search.js"
+import type { NormalizedCheapFields } from "../../../src/riffado/search.js"
+import type { Recording, TranscriptText } from "../../../src/riffado/types.js"
 
 function rec(overrides: Partial<Recording>): Recording {
   return {
@@ -15,6 +23,17 @@ function rec(overrides: Partial<Recording>): Recording {
     transcripts: [],
     ...overrides,
   }
+}
+
+function normalizedFieldsFor(recordings: Recording[]): Map<string, NormalizedCheapFields> {
+  return new Map(recordings.map((r) => [r.id, normalizedCheapFieldsFor(r)]))
+}
+
+function rank(recordings: Recording[], query: string) {
+  const terms = parseQueryTerms(query)
+  const normalizedTerms = terms.map((t) => normalize(t))
+  const ranked = rankByCheapFields(recordings, normalizedFieldsFor(recordings), normalizedTerms)
+  return { ranked, terms, normalizedTerms }
 }
 
 describe("normalize", () => {
@@ -34,33 +53,20 @@ describe("parseQueryTerms", () => {
   })
 })
 
-describe("searchRecordings", () => {
+describe("rankByCheapFields (stage 1)", () => {
   it("ranks a recording matching all terms above one matching a single term many times", () => {
     const recordings = [
-      rec({
-        id: "single-term-heavy",
-        transcripts: [
-          { source: "riffado", provider: "p", model: "m", text: "kita kita kita kita kita" },
-        ],
-      }),
-      rec({
-        id: "full-coverage",
-        transcripts: [
-          { source: "riffado", provider: "p", model: "m", text: "kita und heizung besprochen" },
-        ],
-      }),
+      rec({ id: "single-term-heavy", title: "kita kita kita kita kita" }),
+      rec({ id: "full-coverage", title: "kita und heizung besprochen" }),
     ]
-    const { hits } = searchRecordings(recordings, "kita heizung", {
-      scope: "all",
-      contextChars: 50,
-    })
-    expect(hits[0].recording.id).toBe("full-coverage")
+    const { ranked } = rank(recordings, "kita heizung")
+    expect(ranked[0].recording.id).toBe("full-coverage")
   })
 
   it("is case and diacritic insensitive", () => {
     const recordings = [rec({ title: "Wärmepumpe" })]
-    const { hits } = searchRecordings(recordings, "warmepumpe", { scope: "all", contextChars: 50 })
-    expect(hits).toHaveLength(1)
+    const { ranked } = rank(recordings, "warmepumpe")
+    expect(ranked[0].matchedTerms.size).toBe(1)
   })
 
   it("matches a quoted phrase literally", () => {
@@ -68,42 +74,140 @@ describe("searchRecordings", () => {
       rec({ id: "a", summary: "die kita übergabe war gut" }),
       rec({ id: "b", summary: "die übergabe an die kita war gut" }),
     ]
-    const { hits } = searchRecordings(recordings, '"kita übergabe"', {
-      scope: "all",
-      contextChars: 50,
-    })
-    expect(hits.map((h) => h.recording.id)).toEqual(["a"])
+    const { ranked } = rank(recordings, '"kita übergabe"')
+    expect(ranked.filter((r) => r.matchedTerms.size > 0).map((r) => r.recording.id)).toEqual(["a"])
   })
 
-  it("respects scope: transcript excludes summary-only matches", () => {
+  it("includes zero-score recordings too, in original order (stable sort)", () => {
+    const recordings = [rec({ id: "a" }), rec({ id: "b" }), rec({ id: "c" })]
+    const { ranked } = rank(recordings, "nomatch")
+    expect(ranked.map((r) => r.recording.id)).toEqual(["a", "b", "c"])
+    expect(ranked.every((r) => r.cheapScore === 0)).toBe(true)
+  })
+})
+
+describe("computeCandidateK", () => {
+  it("is at least 30, and grows with limit up to a cap of 200", () => {
+    expect(computeCandidateK(1)).toBe(30)
+    expect(computeCandidateK(10)).toBe(30)
+    expect(computeCandidateK(50)).toBe(150)
+    expect(computeCandidateK(100)).toBe(200)
+    expect(computeCandidateK(500)).toBe(200)
+  })
+})
+
+describe("finalizeSearch (stage 2 + merge)", () => {
+  it("scope: summary never looks at transcriptsById, even with matching candidates", () => {
     const recordings = [rec({ id: "a", summary: "only in summary: einzigartig" })]
-    const { hits } = searchRecordings(recordings, "einzigartig", {
-      scope: "transcript",
-      contextChars: 50,
-    })
+    const { ranked, terms, normalizedTerms } = rank(recordings, "einzigartig")
+    // A non-empty transcriptsById proves scope: summary ignores it entirely.
+    const transcriptsById = new Map<string, TranscriptText[]>([
+      ["a", [{ source: "riffado", text: "einzigartig" }]],
+    ])
+    const { hits } = finalizeSearch(
+      ranked,
+      terms,
+      normalizedTerms,
+      "summary",
+      new Set(["a"]),
+      transcriptsById,
+      { contextChars: 50 },
+    )
+    expect(hits).toHaveLength(1)
+    expect(hits[0].snippets[0]).toContain("summary")
+  })
+
+  it("scope: transcript excludes summary-only matches", () => {
+    const recordings = [rec({ id: "a", summary: "only in summary: einzigartig" })]
+    const { ranked, terms, normalizedTerms } = rank(recordings, "einzigartig")
+    const { hits } = finalizeSearch(
+      ranked,
+      terms,
+      normalizedTerms,
+      "transcript",
+      new Set(["a"]),
+      new Map(),
+      { contextChars: 50 },
+    )
     expect(hits).toHaveLength(0)
   })
 
-  it("respects scope: summary excludes transcript-only matches", () => {
-    const recordings = [
-      rec({
-        id: "a",
-        transcripts: [{ source: "riffado", provider: "p", model: "m", text: "einzigartig" }],
-      }),
-    ]
-    const { hits } = searchRecordings(recordings, "einzigartig", {
-      scope: "summary",
-      contextChars: 50,
-    })
-    expect(hits).toHaveLength(0)
+  it("two-stage: finds a term that is only in a candidate's transcript", () => {
+    // "kita" matches the title (stage-1 candidate); "heizung" only appears in the transcript.
+    const recordings = [rec({ id: "a", title: "Kita Übergabe" })]
+    const { ranked, terms, normalizedTerms } = rank(recordings, "kita heizung")
+    const transcriptsById = new Map<string, TranscriptText[]>([
+      ["a", [{ source: "riffado", text: "wir besprechen die heizung" }]],
+    ])
+    const { hits } = finalizeSearch(
+      ranked,
+      terms,
+      normalizedTerms,
+      "all",
+      new Set(["a"]),
+      transcriptsById,
+      { contextChars: 50 },
+    )
+    expect(hits).toHaveLength(1)
+    expect(hits[0].matchCount).toBe(2)
+    expect(hits[0].snippets.some((s) => s.includes("heizung"))).toBe(true)
   })
+
+  it(
+    "deep: true widens the candidate set -- a non-candidate's transcript-only term is found " +
+      "only once it's included in candidateIds/transcriptsById",
+    () => {
+      const recordings = [rec({ id: "candidate" }), rec({ id: "non-candidate" })]
+      const { ranked, terms, normalizedTerms } = rank(recordings, "zzzneedle")
+      const transcriptsById = new Map<string, TranscriptText[]>([
+        ["candidate", [{ source: "riffado", text: "contains zzzneedle here" }]],
+        ["non-candidate", [{ source: "riffado", text: "also contains zzzneedle here" }]],
+      ])
+
+      // deep: false -- only "candidate" is in the candidate set, even though
+      // transcriptsById happens to have text for both (mirrors the tool only ever
+      // fetching transcripts for the ids it decided to fetch).
+      const shallow = finalizeSearch(
+        ranked,
+        terms,
+        normalizedTerms,
+        "all",
+        new Set(["candidate"]),
+        transcriptsById,
+        { contextChars: 50 },
+      )
+      expect(shallow.hits.map((h) => h.recording.id)).toEqual(["candidate"])
+
+      // deep: true -- every recording is a candidate.
+      const deep = finalizeSearch(
+        ranked,
+        terms,
+        normalizedTerms,
+        "all",
+        new Set(["candidate", "non-candidate"]),
+        transcriptsById,
+        { contextChars: 50 },
+      )
+      expect(deep.hits.map((h) => h.recording.id).sort()).toEqual(["candidate", "non-candidate"])
+    },
+  )
 
   it("produces snippet windows with ellipsis when truncated", () => {
     const longText = `${"x".repeat(200)} needle ${"y".repeat(200)}`
-    const recordings = [
-      rec({ transcripts: [{ source: "riffado", provider: "p", model: "m", text: longText }] }),
-    ]
-    const { hits } = searchRecordings(recordings, "needle", { scope: "all", contextChars: 20 })
+    const recordings = [rec({ id: "a" })]
+    const { ranked, terms, normalizedTerms } = rank(recordings, "needle")
+    const transcriptsById = new Map<string, TranscriptText[]>([
+      ["a", [{ source: "riffado", text: longText }]],
+    ])
+    const { hits } = finalizeSearch(
+      ranked,
+      terms,
+      normalizedTerms,
+      "all",
+      new Set(["a"]),
+      transcriptsById,
+      { contextChars: 20 },
+    )
     expect(hits[0].snippets[0]).toContain("needle")
     expect(hits[0].snippets[0].startsWith("…")).toBe(true)
     expect(hits[0].snippets[0].endsWith("…")).toBe(true)
@@ -113,52 +217,67 @@ describe("searchRecordings", () => {
     const text = Array.from({ length: 10 }, (_, i) => `needle-${i} filler ${"z".repeat(80)}`).join(
       " ",
     )
-    const recordings = [
-      rec({ transcripts: [{ source: "riffado", provider: "p", model: "m", text }] }),
-    ]
-    const { hits } = searchRecordings(recordings, "filler", { scope: "all", contextChars: 10 })
+    const recordings = [rec({ id: "a" })]
+    const { ranked, terms, normalizedTerms } = rank(recordings, "filler")
+    const transcriptsById = new Map<string, TranscriptText[]>([
+      ["a", [{ source: "riffado", text }]],
+    ])
+    const { hits } = finalizeSearch(
+      ranked,
+      terms,
+      normalizedTerms,
+      "all",
+      new Set(["a"]),
+      transcriptsById,
+      { contextChars: 10 },
+    )
     expect(hits[0].snippets.length).toBeLessThanOrEqual(3)
   })
 
   it("returns no hits and the searched terms when nothing matches", () => {
-    const recordings = [rec({ title: "Nothing relevant" })]
-    const { hits, terms } = searchRecordings(recordings, "xyzzy plugh", {
-      scope: "all",
-      contextChars: 50,
-    })
+    const recordings = [rec({ id: "a", title: "Nothing relevant" })]
+    const { ranked, terms, normalizedTerms } = rank(recordings, "xyzzy plugh")
+    const { hits } = finalizeSearch(
+      ranked,
+      terms,
+      normalizedTerms,
+      "summary",
+      new Set(),
+      new Map(),
+      {
+        contextChars: 50,
+      },
+    )
     expect(hits).toEqual([])
     expect(terms).toEqual(["xyzzy", "plugh"])
   })
 
-  it("normalizes each field once per search, not once per term (perf regression pin)", () => {
-    // None of these terms occur in the text, so this isolates the scanning cost
-    // (normalizing field text) from any snippet/offset-map building on a hit.
+  it("normalizes each transcript field once per call, not once per term (perf regression pin)", () => {
     const filler = "the quick brown fox jumps over the lazy dog ".repeat(150)
-    const recordings = [
-      rec({ transcripts: [{ source: "riffado", provider: "p", model: "m", text: filler }] }),
-    ]
+    const recordings = [rec({ id: "a" })]
+    const transcriptsById = new Map<string, TranscriptText[]>([
+      ["a", [{ source: "riffado", text: filler }]],
+    ])
 
-    // Field normalization runs through String.prototype.normalize("NFD") once per
-    // original character. Counting calls to it is a direct, non-flaky proxy for how
-    // many times a field got (re-)normalized, without reaching into module internals.
     const spy = vi.spyOn(String.prototype, "normalize")
 
+    const run = (query: string) => {
+      const { ranked, terms, normalizedTerms } = rank(recordings, query)
+      finalizeSearch(ranked, terms, normalizedTerms, "all", new Set(["a"]), transcriptsById, {
+        contextChars: 50,
+      })
+    }
+
     spy.mockClear()
-    searchRecordings(recordings, "zzznomatch1", { scope: "all", contextChars: 50 })
+    run("zzznomatch1")
     const callsForOneTerm = spy.mock.calls.length
 
     spy.mockClear()
-    searchRecordings(recordings, "zzznomatch1 zzznomatch2 zzznomatch3 zzznomatch4 zzznomatch5", {
-      scope: "all",
-      contextChars: 50,
-    })
+    run("zzznomatch1 zzznomatch2 zzznomatch3 zzznomatch4 zzznomatch5")
     const callsForFiveTerms = spy.mock.calls.length
 
     spy.mockRestore()
 
-    // Re-normalizing per term (the bug) would make this ~5x for 5 terms vs 1. Normalizing
-    // each field once per search (the fix) keeps it roughly flat, since the dominant cost
-    // (the transcript field) is independent of the number of terms scanned against it.
     expect(callsForOneTerm).toBeGreaterThan(0)
     expect(callsForFiveTerms).toBeLessThan(callsForOneTerm * 2)
   })
