@@ -22,8 +22,8 @@ compound-splitter to catch that, not just a smarter analyzer. The current
 approach (`indexOf` over normalized, un-tokenized text) gets substring
 matching for free. Building and keeping an index in sync would also mean
 holding normalized transcript text in memory permanently — exactly what the
-store split in 0.1.0 was for. Revisit only if profiling shows stage 2 itself
-(not the whole corpus) is the bottleneck at realistic K.
+metadata/on-demand-transcript split below avoids. Revisit only if profiling
+shows stage 2 itself (not the whole corpus) is the bottleneck at realistic K.
 
 Measured numbers: [`docs/performance.md`](./performance.md).
 
@@ -47,9 +47,9 @@ touches disk — only the LRU, in memory, same invariant as before.
 
 ## Incremental refresh: two phases, the IV as the change signal
 
-`RecordingStore.refresh()` (v0.2.0+) is two-phase, so an unchanged corpus
-costs a small, flat transfer instead of re-transferring and re-decrypting
-every recording every `CACHE_TTL_MS`.
+`RecordingStore.refresh()` is two-phase, so an unchanged corpus costs a
+small, flat transfer instead of re-transferring and re-decrypting every
+recording every `CACHE_TTL_MS`.
 
 **Phase 1** (`STAMP_QUERY`) computes a per-recording change stamp from `left()`
 prefixes only -- never a full ciphertext column -- built from the IV segment
