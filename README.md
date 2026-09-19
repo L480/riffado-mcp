@@ -150,19 +150,17 @@ TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5433/riffado_test \
 docker compose -f docker-compose.test.yml down
 ```
 
-## Memory & performance characteristics
+## Performance
 
-`RecordingStore.get()` returns metadata only (title, summary, key points,
-action items, transcript _descriptors_ — no text), refreshed and cached for
-`CACHE_TTL_MS`. Transcript text is fetched on demand via
-`getTranscripts(recordingIds)` — one batched query for exactly the ids that
-need it, decrypted, served from a small LRU (`transcriptCacheSize`, default
-~50 recordings). Memory now scales with the cheap fields (summaries, key
-points, titles), not with the full decrypted transcript corpus.
+Search is two-stage: cheap fields (title/summary/key points/action items)
+rank the whole corpus first, then only the top candidates get their
+transcripts fetched and scanned — `deep: true` trades that speed for full
+recall by scanning every date-filtered recording's transcript instead, and
+is far slower by design. Headline number: a 3-term `scope: "all"` search at
+20 000 recordings runs in ~175 ms (p50).
 
-See the [`v0.1.0` release notes](https://github.com/L480/riffado-mcp/releases/tag/v0.1.0)
-for measured before/after numbers (search latency and RSS delta at
-N=1000/5000/20000 recordings).
+Full measured numbers and limitations: [`docs/performance.md`](./docs/performance.md).
+Harness + reproduction steps: [`bench/README.md`](./bench/README.md).
 
 ## Security notes
 

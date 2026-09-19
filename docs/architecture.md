@@ -25,6 +25,8 @@ holding normalized transcript text in memory permanently — exactly what the
 store split in 0.1.0 was for. Revisit only if profiling shows stage 2 itself
 (not the whole corpus) is the bottleneck at realistic K.
 
+Measured numbers: [`docs/performance.md`](./performance.md).
+
 ## The store is split: cheap metadata vs. on-demand transcript text
 
 `RecordingStore.get()` returns metadata only — title, summary, key points,
