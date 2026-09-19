@@ -138,6 +138,7 @@ export function registerRiffadoTools(server: McpServer, store: RecordingStore): 
       const { terms, hits } = searchRecordings(filtered, args.query, {
         scope: args.scope,
         contextChars: args.context_chars,
+        limit: args.limit,
       })
       const limited = hits.slice(0, args.limit)
       const termsLabel = terms.map((t) => `"${t}"`).join(", ")

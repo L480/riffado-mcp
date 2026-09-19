@@ -14,6 +14,13 @@ export interface SearchOptions {
   scope: SearchScope
   contextChars: number
   maxSnippetsPerRecording?: number
+  /**
+   * Perf hint only, doesn't change results: offset maps + snippets are only
+   * built for the top `limit` ranked hits (the rest come back with `snippets: []`,
+   * since callers slice to this same limit before rendering). Omit to build
+   * for every hit, as before.
+   */
+  limit?: number
 }
 
 export interface SearchHit {
@@ -53,6 +60,26 @@ function normalizeWithMap(text: string): NormalizedText {
     }
   }
   return { normalized, map }
+}
+
+/**
+ * Same normalization as `normalizeWithMap`, without the per-character offset
+ * map — used during scanning, where only the normalized string is needed.
+ * The map is only worth paying for later, for the fields/hits that survive
+ * ranking (see `translateOccurrences`).
+ */
+function normalizeOnly(text: string): string {
+  let normalized = ""
+  for (let i = 0; i < text.length; i++) {
+    const decomposed = text[i].normalize("NFD")
+    for (const ch of decomposed) {
+      if (isCombiningMark(ch)) {
+        continue
+      }
+      normalized += ch.toLowerCase()
+    }
+  }
+  return normalized
 }
 
 function isCombiningMark(ch: string): boolean {
@@ -107,24 +134,50 @@ interface Occurrence {
   end: number
 }
 
-function findOccurrences(field: Field, normalizedTerm: string): Occurrence[] {
-  if (!normalizedTerm || !field.text) {
+/** An occurrence in normalized-string space, before translation back to original offsets. */
+interface NormOccurrence {
+  start: number
+  end: number
+}
+
+function findOccurrencesInNormalized(normalized: string, normalizedTerm: string): NormOccurrence[] {
+  if (!normalizedTerm || !normalized) {
     return []
   }
-  const { normalized, map } = normalizeWithMap(field.text)
-  const occurrences: Occurrence[] = []
+  const occurrences: NormOccurrence[] = []
   let from = 0
   for (;;) {
     const idx = normalized.indexOf(normalizedTerm, from)
     if (idx === -1) {
       break
     }
-    const start = map[idx]
-    const end = map[idx + normalizedTerm.length - 1] + 1
-    occurrences.push({ fieldIndex: 0, start, end })
+    occurrences.push({ start: idx, end: idx + normalizedTerm.length })
     from = idx + Math.max(1, normalizedTerm.length)
   }
   return occurrences
+}
+
+/**
+ * Translates normalized-space occurrences back to original-space, building
+ * the offset map only for fields that actually had occurrences — called
+ * only for the hits that survive ranking + the caller's limit.
+ */
+function translateOccurrences(
+  fields: Field[],
+  occurrencesByField: NormOccurrence[][],
+): Occurrence[][] {
+  return fields.map((field, fieldOrdinal) => {
+    const normOccurrences = occurrencesByField[fieldOrdinal]
+    if (!normOccurrences || normOccurrences.length === 0) {
+      return []
+    }
+    const { map } = normalizeWithMap(field.text)
+    return normOccurrences.map(({ start, end }) => ({
+      fieldIndex: fieldOrdinal,
+      start: map[start],
+      end: map[end - 1] + 1,
+    }))
+  })
 }
 
 interface Window {
@@ -181,6 +234,14 @@ function buildSnippets(
   return out
 }
 
+interface Candidate {
+  recording: Recording
+  fields: Field[]
+  score: number
+  matchCount: number
+  occurrencesByField: NormOccurrence[][]
+}
+
 /** Searches decrypted recordings, ranked by term coverage then weighted hits. */
 export function searchRecordings(
   recordings: Recording[],
@@ -191,21 +252,25 @@ export function searchRecordings(
   const normalizedTerms = terms.map((t) => normalize(t))
   const maxSnippets = options.maxSnippetsPerRecording ?? 3
 
-  const hits: SearchHit[] = []
+  const candidates: Candidate[] = []
   for (const recording of recordings) {
     const fields = fieldsForRecording(recording, options.scope)
     if (fields.length === 0 || normalizedTerms.length === 0) {
       continue
     }
 
-    const occurrencesByField: Occurrence[][] = fields.map(() => [])
+    // Normalize each field once per search, not once per term (the hot loop below is
+    // normalizedTerms × fields; re-normalizing per term made this linear in term count).
+    const normalizedFields = fields.map((field) => normalizeOnly(field.text))
+
+    const occurrencesByField: NormOccurrence[][] = fields.map(() => [])
     const matchedTerms = new Set<string>()
     let weightedHits = 0
     let matchCount = 0
 
     normalizedTerms.forEach((normTerm) => {
       fields.forEach((field, fieldOrdinal) => {
-        const occurrences = findOccurrences(field, normTerm)
+        const occurrences = findOccurrencesInNormalized(normalizedFields[fieldOrdinal], normTerm)
         if (occurrences.length > 0) {
           matchedTerms.add(normTerm)
           matchCount += occurrences.length
@@ -222,14 +287,28 @@ export function searchRecordings(
     const coverage = matchedTerms.size / normalizedTerms.length
     const score = coverage * 1000 + weightedHits
 
-    hits.push({
-      recording,
-      score,
-      matchCount,
-      snippets: buildSnippets(fields, occurrencesByField, options.contextChars, maxSnippets),
-    })
+    candidates.push({ recording, fields, score, matchCount, occurrencesByField })
   }
 
-  hits.sort((a, b) => b.score - a.score)
+  candidates.sort((a, b) => b.score - a.score)
+
+  // Offset maps + snippets are the expensive part (per-character map build). Only the
+  // hits the caller will actually render need them — the rest report snippets: [].
+  const snippetLimit = options.limit ?? candidates.length
+  const hits: SearchHit[] = candidates.map((c, i) => ({
+    recording: c.recording,
+    score: c.score,
+    matchCount: c.matchCount,
+    snippets:
+      i < snippetLimit
+        ? buildSnippets(
+            c.fields,
+            translateOccurrences(c.fields, c.occurrencesByField),
+            options.contextChars,
+            maxSnippets,
+          )
+        : [],
+  }))
+
   return { terms, hits }
 }

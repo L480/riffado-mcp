@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { normalize, parseQueryTerms, searchRecordings } from "../../../src/riffado/search.js"
 import type { Recording } from "../../../src/riffado/types.js"
 
@@ -128,5 +128,38 @@ describe("searchRecordings", () => {
     })
     expect(hits).toEqual([])
     expect(terms).toEqual(["xyzzy", "plugh"])
+  })
+
+  it("normalizes each field once per search, not once per term (perf regression pin)", () => {
+    // None of these terms occur in the text, so this isolates the scanning cost
+    // (normalizing field text) from any snippet/offset-map building on a hit.
+    const filler = "the quick brown fox jumps over the lazy dog ".repeat(150)
+    const recordings = [
+      rec({ transcripts: [{ source: "riffado", provider: "p", model: "m", text: filler }] }),
+    ]
+
+    // Field normalization runs through String.prototype.normalize("NFD") once per
+    // original character. Counting calls to it is a direct, non-flaky proxy for how
+    // many times a field got (re-)normalized, without reaching into module internals.
+    const spy = vi.spyOn(String.prototype, "normalize")
+
+    spy.mockClear()
+    searchRecordings(recordings, "zzznomatch1", { scope: "all", contextChars: 50 })
+    const callsForOneTerm = spy.mock.calls.length
+
+    spy.mockClear()
+    searchRecordings(recordings, "zzznomatch1 zzznomatch2 zzznomatch3 zzznomatch4 zzznomatch5", {
+      scope: "all",
+      contextChars: 50,
+    })
+    const callsForFiveTerms = spy.mock.calls.length
+
+    spy.mockRestore()
+
+    // Re-normalizing per term (the bug) would make this ~5x for 5 terms vs 1. Normalizing
+    // each field once per search (the fix) keeps it roughly flat, since the dominant cost
+    // (the transcript field) is independent of the number of terms scanned against it.
+    expect(callsForOneTerm).toBeGreaterThan(0)
+    expect(callsForFiveTerms).toBeLessThan(callsForOneTerm * 2)
   })
 })
