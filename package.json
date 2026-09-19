@@ -1,6 +1,6 @@
 {
   "name": "riffado-mcp",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "MCP server for the Riffado voice-recording archive (transcripts, AI summaries, key points, action items) — read-only.",
   "license": "MIT",
   "author": "Nico Struck",

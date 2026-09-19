@@ -19,8 +19,13 @@ This server hands an LLM client the full text of private voice recordings.
 That makes the deployment, not just the code, part of the security surface:
 
 - **`HTTP_AUTH_TOKEN` is the only thing protecting the HTTP transport.** Make
-  it a long random secret. If it is unset, the HTTP transport serves every
-  request unauthenticated — the server logs a loud warning, but it will run.
+  it a long random secret — at least 32 characters, enforced at startup. If
+  it is unset, the HTTP transport serves every request unauthenticated — the
+  server logs a loud warning, but it will run.
+- **`GET /health` is liveness-only and unauthenticated by design** (status +
+  timestamp, nothing else). Session count, DB reachability and cached
+  recording count live at `GET /health/details`, which requires the same
+  auth as every other route.
 - **Do not put Cloudflare Access or another identity-aware proxy in front.**
   It breaks the MCP OAuth flow (see [`docs/architecture.md`](./docs/architecture.md)),
   so the token _is_ the access control. Compensate with token length, not with
@@ -42,5 +47,10 @@ That makes the deployment, not just the code, part of the security surface:
   this server can prevent that; be aware of it when connecting a client that
   also has write access to other systems.
 - **OAuth state at rest.** `HTTP_OAUTH_STATE_FILE` holds issued access and
-  refresh tokens in plaintext JSON. Keep it on a volume only the container
-  user can read.
+  refresh tokens in plaintext JSON. The server writes it atomically at
+  `0600`; keep it on a volume only the container user can read regardless.
+- **OAuth client registration (`/register`) is unauthenticated by spec** —
+  Claude's dynamic client registration has to be. The registry is capped
+  (default 100 clients, oldest evicted first) so an anonymous caller can't
+  grow it or the state file without bound, and `/register`, `/authorize`,
+  `/token` sit behind a tighter rate limit than the rest of the API.
