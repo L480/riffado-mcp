@@ -54,13 +54,14 @@ export function registerRiffadoResources(server: McpServer, store: RecordingStor
           ],
         }
       }
-      const transcript = rec.transcripts[0]
-      const text = formatRecordingDetail(
-        rec,
-        transcript
-          ? { source: transcript.source, text: transcript.text, truncated: false }
-          : undefined,
-      )
+      const descriptor = rec.transcripts[0]
+      let transcript: { source: string; text: string; truncated: false } | undefined
+      if (descriptor) {
+        const textsBySource = (await store.getTranscripts([rec.id])).get(rec.id) ?? []
+        const fullText = textsBySource.find((t) => t.source === descriptor.source)?.text ?? ""
+        transcript = { source: descriptor.source, text: fullText, truncated: false }
+      }
+      const text = formatRecordingDetail(rec, transcript)
       return { contents: [{ uri: uri.href, mimeType: "text/markdown", text }] }
     },
   )

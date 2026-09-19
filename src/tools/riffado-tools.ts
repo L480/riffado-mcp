@@ -7,7 +7,13 @@
 import { z } from "zod"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { RecordingStore } from "../riffado/store.js"
-import { searchRecordings } from "../riffado/search.js"
+import {
+  computeCandidateK,
+  finalizeSearch,
+  normalize,
+  parseQueryTerms,
+  rankByCheapFields,
+} from "../riffado/search.js"
 import {
   formatActionItemEntry,
   formatDuration,
@@ -17,7 +23,7 @@ import {
   sliceText,
   snippet,
 } from "../riffado/format.js"
-import type { ActionItemEntry, Recording } from "../riffado/types.js"
+import type { ActionItemEntry, Recording, TranscriptText } from "../riffado/types.js"
 
 const SEARCH_TERM_HINT =
   "No stemming is applied — pass German *and* English variants of a term " +
@@ -113,9 +119,13 @@ export function registerRiffadoTools(server: McpServer, store: RecordingStore): 
     {
       title: "Search Riffado recordings",
       description:
-        `Full-text search over decrypted transcripts, summaries, key points and action items ` +
-        `(the database only holds ciphertext, so this runs in-process, not in SQL). ` +
-        `Quote a phrase to search it as one term. ${SEARCH_TERM_HINT}`,
+        `Search over titles, summaries, key points, action items and transcripts (the database ` +
+        `only holds ciphertext, so this runs in-process, not in SQL). Two-stage: ranks the whole ` +
+        `corpus on titles/summaries/key points/action items first, then scans transcript text ` +
+        `only for the top-ranked candidates (scope: "all", the default) — so a no-hit result can ` +
+        `be a narrowing artifact, not proof of absence. Pass deep: true to scan every recording's ` +
+        `transcript instead (slow, cost scales with corpus size — combine with from/to). Quote a ` +
+        `phrase to search it as one term. ${SEARCH_TERM_HINT}`,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
       inputSchema: {
         query: z.string().min(1).describe('Search terms; "quoted phrases" match literally.'),
@@ -130,23 +140,64 @@ export function registerRiffadoTools(server: McpServer, store: RecordingStore): 
           .max(2000)
           .default(300)
           .describe("Snippet context window."),
+        deep: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Slow — scans every recording's transcript that passes the date filter, instead of " +
+              "only the top-ranked candidates. Cost scales with corpus size; combine with from/to " +
+              "to bound it. Use when a term might appear only in a transcript and in no " +
+              "title/summary/key point/action item.",
+          ),
       },
     },
     async (args) => {
       const recordings = await store.get()
       const filtered = filterByRange(recordings, args.from, args.to)
-      const { terms, hits } = searchRecordings(filtered, args.query, {
-        scope: args.scope,
-        contextChars: args.context_chars,
-        limit: args.limit,
-      })
+      const terms = parseQueryTerms(args.query)
+      const normalizedTerms = terms.map((t) => normalize(t))
+
+      const normalizedFieldsById = await store.getNormalizedFields()
+      const ranked = rankByCheapFields(filtered, normalizedFieldsById, normalizedTerms)
+
+      let candidateIds = new Set<string>()
+      let transcriptsById = new Map<string, TranscriptText[]>()
+      let candidateCount = 0
+
+      if (args.scope !== "summary" && normalizedTerms.length > 0) {
+        const k = computeCandidateK(args.limit)
+        const candidateRecordings = args.deep
+          ? filtered
+          : ranked.slice(0, k).map((c) => c.recording)
+        candidateCount = candidateRecordings.length
+        candidateIds = new Set(candidateRecordings.map((r) => r.id))
+        transcriptsById = await store.getTranscripts(candidateRecordings.map((r) => r.id))
+      }
+
+      const { hits } = finalizeSearch(
+        ranked,
+        terms,
+        normalizedTerms,
+        args.scope,
+        candidateIds,
+        transcriptsById,
+        { contextChars: args.context_chars, limit: args.limit },
+      )
       const limited = hits.slice(0, args.limit)
       const termsLabel = terms.map((t) => `"${t}"`).join(", ")
+
+      const narrowingNote =
+        args.scope !== "summary" && !args.deep
+          ? ` Transcript text was scanned only for the top ${candidateCount} candidate(s), ranked ` +
+            `by title/summary/key-point/action-item match — pass deep: true to scan every ` +
+            `recording's transcript instead (slower, scales with corpus size); a no-hit result ` +
+            `here may be a narrowing artifact, not proof of absence.`
+          : ""
 
       if (limited.length === 0) {
         const text =
           `No matches for ${termsLabel} (scope: ${args.scope}` +
-          `${args.from || args.to ? ", date-filtered" : ""}). ` +
+          `${args.from || args.to ? ", date-filtered" : ""}).${narrowingNote} ` +
           `Report honestly that nothing was found — don't answer from general knowledge.`
         return {
           content: [{ type: "text" as const, text }],
@@ -155,7 +206,7 @@ export function registerRiffadoTools(server: McpServer, store: RecordingStore): 
       }
 
       const text = [
-        `${hits.length} recording(s) matched ${termsLabel} (scope: ${args.scope}), showing ${limited.length}.`,
+        `${hits.length} recording(s) matched ${termsLabel} (scope: ${args.scope}), showing ${limited.length}.${narrowingNote}`,
         "",
         ...limited.map(formatSearchHit),
       ].join("\n\n")
@@ -229,7 +280,9 @@ export function registerRiffadoTools(server: McpServer, store: RecordingStore): 
           }
         }
         if (!unavailableNote) {
-          const slice = sliceText(chosen.text, args.transcript_offset, args.transcript_limit_chars)
+          const textsBySource = (await store.getTranscripts([rec.id])).get(rec.id) ?? []
+          const fullText = textsBySource.find((t) => t.source === chosen.source)?.text ?? ""
+          const slice = sliceText(fullText, args.transcript_offset, args.transcript_limit_chars)
           transcriptBlock = {
             source: chosen.source,
             text: slice.text,

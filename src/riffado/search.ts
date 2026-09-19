@@ -1,27 +1,23 @@
 /**
- * In-memory search over decrypted recordings. Pure functions, no I/O — the
- * DB only ever holds ciphertext (see `docs/architecture.md`), so search has
- * to happen here, after decryption, not in SQL.
+ * Two-stage in-memory search over decrypted metadata + on-demand transcript
+ * text. Pure functions, no I/O of their own -- callers (`riffado-tools.ts`)
+ * fetch data (`store.get()`, `store.getTranscripts()`) and pass results in.
+ * See `docs/architecture.md` for why the DB can't do this and why an
+ * inverted index was rejected.
+ *
+ * Stage 1 (`rankByCheapFields`) scores the whole corpus over pre-normalized
+ * title/summary/key-points/action-items text only -- cheap, always in
+ * memory (existing weights: title 5, summary/keyPoints/actionItems 4).
+ * Stage 2 (`finalizeSearch`) adds transcript matches (weight 1) for a
+ * caller-chosen candidate set (normally the stage-1 top-K, or every
+ * recording under `deep: true`), merges the scores, and builds snippets.
  *
  * No stemming: callers (tool descriptions, the `riffado_ask` prompt) are
  * told to pass German *and* English term variants themselves.
  */
-import type { Recording } from "./types.js"
+import type { Recording, TranscriptText } from "./types.js"
 
 export type SearchScope = "all" | "transcript" | "summary"
-
-export interface SearchOptions {
-  scope: SearchScope
-  contextChars: number
-  maxSnippetsPerRecording?: number
-  /**
-   * Perf hint only, doesn't change results: offset maps + snippets are only
-   * built for the top `limit` ranked hits (the rest come back with `snippets: []`,
-   * since callers slice to this same limit before rendering). Omit to build
-   * for every hit, as before.
-   */
-  limit?: number
-}
 
 export interface SearchHit {
   recording: Recording
@@ -64,7 +60,7 @@ function normalizeWithMap(text: string): NormalizedText {
 
 /**
  * Same normalization as `normalizeWithMap`, without the per-character offset
- * map — used during scanning, where only the normalized string is needed.
+ * map -- used during scanning, where only the normalized string is needed.
  * The map is only worth paying for later, for the fields/hits that survive
  * ranking (see `translateOccurrences`).
  */
@@ -104,28 +100,55 @@ export function parseQueryTerms(query: string): string[] {
 interface Field {
   weight: number
   text: string
+  /** Precomputed by `normalizedCheapFieldsFor`; when absent (transcript
+   * fields), computed on the fly during scoring. */
+  normalized?: string
 }
 
-function fieldsForRecording(recording: Recording, scope: SearchScope): Field[] {
-  const fields: Field[] = []
-  if (scope !== "transcript") {
-    fields.push({ weight: 5, text: recording.title })
-    if (recording.summary) {
-      fields.push({ weight: 4, text: recording.summary })
-    }
-    if (recording.keyPoints.length > 0) {
-      fields.push({ weight: 4, text: recording.keyPoints.join(" \n ") })
-    }
-    if (recording.actionItems.length > 0) {
-      fields.push({ weight: 4, text: recording.actionItems.join(" \n ") })
-    }
+/** Pre-normalized title/summary/key-points/action-items text for one
+ * recording -- built once per store refresh, not once per search. */
+export interface NormalizedCheapFields {
+  title: string
+  summary: string
+  keyPoints: string
+  actionItems: string
+}
+
+/** Builds the stage-1 normalized-field cache entry for one recording. */
+export function normalizedCheapFieldsFor(recording: Recording): NormalizedCheapFields {
+  return {
+    title: normalize(recording.title),
+    summary: recording.summary ? normalize(recording.summary) : "",
+    keyPoints: recording.keyPoints.length > 0 ? normalize(recording.keyPoints.join(" \n ")) : "",
+    actionItems:
+      recording.actionItems.length > 0 ? normalize(recording.actionItems.join(" \n ")) : "",
   }
-  if (scope !== "summary") {
-    for (const t of recording.transcripts) {
-      fields.push({ weight: 1, text: t.text })
-    }
+}
+
+function cheapFields(recording: Recording, normalized: NormalizedCheapFields): Field[] {
+  const fields: Field[] = [{ weight: 5, text: recording.title, normalized: normalized.title }]
+  if (recording.summary) {
+    fields.push({ weight: 4, text: recording.summary, normalized: normalized.summary })
+  }
+  if (recording.keyPoints.length > 0) {
+    fields.push({
+      weight: 4,
+      text: recording.keyPoints.join(" \n "),
+      normalized: normalized.keyPoints,
+    })
+  }
+  if (recording.actionItems.length > 0) {
+    fields.push({
+      weight: 4,
+      text: recording.actionItems.join(" \n "),
+      normalized: normalized.actionItems,
+    })
   }
   return fields
+}
+
+function transcriptFields(texts: TranscriptText[]): Field[] {
+  return texts.map((t) => ({ weight: 1, text: t.text }))
 }
 
 interface Occurrence {
@@ -159,7 +182,7 @@ function findOccurrencesInNormalized(normalized: string, normalizedTerm: string)
 
 /**
  * Translates normalized-space occurrences back to original-space, building
- * the offset map only for fields that actually had occurrences — called
+ * the offset map only for fields that actually had occurrences -- called
  * only for the hits that survive ranking + the caller's limit.
  */
 function translateOccurrences(
@@ -234,68 +257,187 @@ function buildSnippets(
   return out
 }
 
-interface Candidate {
-  recording: Recording
-  fields: Field[]
-  score: number
-  matchCount: number
+interface FieldScore {
   occurrencesByField: NormOccurrence[][]
+  matchedTerms: Set<string>
+  weightedHits: number
+  matchCount: number
 }
 
-/** Searches decrypted recordings, ranked by term coverage then weighted hits. */
-export function searchRecordings(
+/** Normalizes each field once per call (not once per term) and scans every
+ * term against every field. */
+function scoreFields(fields: Field[], normalizedTerms: string[]): FieldScore {
+  const normalizedFieldTexts = fields.map((field) => field.normalized ?? normalizeOnly(field.text))
+  const occurrencesByField: NormOccurrence[][] = fields.map(() => [])
+  const matchedTerms = new Set<string>()
+  let weightedHits = 0
+  let matchCount = 0
+
+  normalizedTerms.forEach((normTerm) => {
+    fields.forEach((field, fieldOrdinal) => {
+      const occurrences = findOccurrencesInNormalized(normalizedFieldTexts[fieldOrdinal], normTerm)
+      if (occurrences.length > 0) {
+        matchedTerms.add(normTerm)
+        matchCount += occurrences.length
+        weightedHits += occurrences.length * field.weight
+        occurrencesByField[fieldOrdinal].push(...occurrences)
+      }
+    })
+  })
+
+  return { occurrencesByField, matchedTerms, weightedHits, matchCount }
+}
+
+function scoreOf(matchedTerms: Set<string>, weightedHits: number, termCount: number): number {
+  const coverage = termCount > 0 ? matchedTerms.size / termCount : 0
+  return coverage * 1000 + weightedHits
+}
+
+export interface RankedCandidate {
+  recording: Recording
+  fields: Field[]
+  occurrencesByField: NormOccurrence[][]
+  matchedTerms: Set<string>
+  weightedHits: number
+  matchCount: number
+  cheapScore: number
+}
+
+/**
+ * Stage 1: scores every recording's pre-normalized title/summary/key-points/
+ * action-items, ranked descending by score. Includes zero-score recordings
+ * too (`Array.sort` is stable, so ties keep the caller's original order) --
+ * a caller slicing the top K still gets K entries even when few or no
+ * recordings matched a cheap field. That matters for `finalizeSearch`: it's
+ * what makes "candidate" vs "non-candidate" a meaningful, testable split
+ * even for a term that appears in no title/summary at all.
+ */
+export function rankByCheapFields(
   recordings: Recording[],
-  query: string,
-  options: SearchOptions,
+  normalizedFieldsById: Map<string, NormalizedCheapFields>,
+  normalizedTerms: string[],
+): RankedCandidate[] {
+  const ranked = recordings.map((recording) => {
+    const normalized = normalizedFieldsById.get(recording.id) ?? normalizedCheapFieldsFor(recording)
+    const fields = cheapFields(recording, normalized)
+    const { occurrencesByField, matchedTerms, weightedHits, matchCount } = scoreFields(
+      fields,
+      normalizedTerms,
+    )
+    return {
+      recording,
+      fields,
+      occurrencesByField,
+      matchedTerms,
+      weightedHits,
+      matchCount,
+      cheapScore: scoreOf(matchedTerms, weightedHits, normalizedTerms.length),
+    }
+  })
+  ranked.sort((a, b) => b.cheapScore - a.cheapScore)
+  return ranked
+}
+
+/** `K = min(max(limit * 3, 30), 200)` -- the stage-2 candidate-set size. An
+ * internal tuning knob, not a tool parameter. */
+export function computeCandidateK(limit: number): number {
+  return Math.min(Math.max(limit * 3, 30), 200)
+}
+
+export interface FinalizeOptions {
+  contextChars: number
+  maxSnippetsPerRecording?: number
+  /** Only the top `limit` ranked hits get snippets built (perf hint, doesn't
+   * change results) -- the rest come back with `snippets: []`. */
+  limit?: number
+}
+
+/**
+ * Stage 2 + merge. `candidateIds` decides which ranked recordings get their
+ * transcripts scored (normally the stage-1 top-K, or every recording under
+ * `deep: true`); `transcriptsById` must already hold text for exactly those
+ * ids (fetched by the caller via `store.getTranscripts`) -- an id outside
+ * `candidateIds` is treated as having no transcript, even if
+ * `transcriptsById` happens to hold an entry for it.
+ *
+ * `scope: "summary"` never looks at `candidateIds`/`transcriptsById` --
+ * cheap-field matches only. `"transcript"` reports transcript-only matches
+ * for the candidate set (cheap-field matches don't count, matching the old
+ * single-stage `scope: "transcript"` behavior). `"all"` merges both.
+ */
+export function finalizeSearch(
+  ranked: RankedCandidate[],
+  terms: string[],
+  normalizedTerms: string[],
+  scope: SearchScope,
+  candidateIds: Set<string>,
+  transcriptsById: Map<string, TranscriptText[]>,
+  options: FinalizeOptions,
 ): SearchResult {
-  const terms = parseQueryTerms(query)
-  const normalizedTerms = terms.map((t) => normalize(t))
   const maxSnippets = options.maxSnippetsPerRecording ?? 3
 
-  const candidates: Candidate[] = []
-  for (const recording of recordings) {
-    const fields = fieldsForRecording(recording, options.scope)
-    if (fields.length === 0 || normalizedTerms.length === 0) {
-      continue
-    }
-
-    // Normalize each field once per search, not once per term (the hot loop below is
-    // normalizedTerms × fields; re-normalizing per term made this linear in term count).
-    const normalizedFields = fields.map((field) => normalizeOnly(field.text))
-
-    const occurrencesByField: NormOccurrence[][] = fields.map(() => [])
-    const matchedTerms = new Set<string>()
-    let weightedHits = 0
-    let matchCount = 0
-
-    normalizedTerms.forEach((normTerm) => {
-      fields.forEach((field, fieldOrdinal) => {
-        const occurrences = findOccurrencesInNormalized(normalizedFields[fieldOrdinal], normTerm)
-        if (occurrences.length > 0) {
-          matchedTerms.add(normTerm)
-          matchCount += occurrences.length
-          weightedHits += occurrences.length * field.weight
-          occurrencesByField[fieldOrdinal].push(...occurrences)
-        }
-      })
-    })
-
-    if (matchedTerms.size === 0) {
-      continue
-    }
-
-    const coverage = matchedTerms.size / normalizedTerms.length
-    const score = coverage * 1000 + weightedHits
-
-    candidates.push({ recording, fields, score, matchCount, occurrencesByField })
+  interface Final {
+    recording: Recording
+    fields: Field[]
+    occurrencesByField: NormOccurrence[][]
+    matchedTerms: Set<string>
+    weightedHits: number
+    matchCount: number
   }
 
-  candidates.sort((a, b) => b.score - a.score)
+  const finals: Final[] = []
+
+  for (const rc of ranked) {
+    if (scope === "summary") {
+      if (rc.matchedTerms.size > 0) {
+        finals.push(rc)
+      }
+      continue
+    }
+
+    const isCandidate = candidateIds.has(rc.recording.id)
+    const texts = isCandidate ? (transcriptsById.get(rc.recording.id) ?? []) : []
+    const tFields = transcriptFields(texts)
+    const tScore = scoreFields(tFields, normalizedTerms)
+
+    if (scope === "transcript") {
+      if (tScore.matchedTerms.size > 0) {
+        finals.push({
+          recording: rc.recording,
+          fields: tFields,
+          occurrencesByField: tScore.occurrencesByField,
+          matchedTerms: tScore.matchedTerms,
+          weightedHits: tScore.weightedHits,
+          matchCount: tScore.matchCount,
+        })
+      }
+      continue
+    }
+
+    // scope === "all": merge stage 1 (cheap) + stage 2 (transcript).
+    const matchedTerms = new Set([...rc.matchedTerms, ...tScore.matchedTerms])
+    if (matchedTerms.size > 0) {
+      finals.push({
+        recording: rc.recording,
+        fields: [...rc.fields, ...tFields],
+        occurrencesByField: [...rc.occurrencesByField, ...tScore.occurrencesByField],
+        matchedTerms,
+        weightedHits: rc.weightedHits + tScore.weightedHits,
+        matchCount: rc.matchCount + tScore.matchCount,
+      })
+    }
+  }
+
+  const scored = finals.map((f) => ({
+    ...f,
+    score: scoreOf(f.matchedTerms, f.weightedHits, normalizedTerms.length),
+  }))
+  scored.sort((a, b) => b.score - a.score)
 
   // Offset maps + snippets are the expensive part (per-character map build). Only the
-  // hits the caller will actually render need them — the rest report snippets: [].
-  const snippetLimit = options.limit ?? candidates.length
-  const hits: SearchHit[] = candidates.map((c, i) => ({
+  // hits the caller will actually render need them -- the rest report snippets: [].
+  const snippetLimit = options.limit ?? scored.length
+  const hits: SearchHit[] = scored.map((c, i) => ({
     recording: c.recording,
     score: c.score,
     matchCount: c.matchCount,
