@@ -45,6 +45,61 @@ by `transcriptCacheSize`, default ~50 recordings) so paging one recording's
 transcript doesn't requery it on every call. Decrypted text still never
 touches disk — only the LRU, in memory, same invariant as before.
 
+## Incremental refresh: two phases, the IV as the change signal
+
+`RecordingStore.refresh()` (v0.2.0+) is two-phase, so an unchanged corpus
+costs a small, flat transfer instead of re-transferring and re-decrypting
+every recording every `CACHE_TTL_MS`.
+
+**Phase 1** (`STAMP_QUERY`) computes a per-recording change stamp from `left()`
+prefixes only -- never a full ciphertext column -- built from the IV segment
+of each encrypted field (`filename`, `summary`, `key_points`,
+`action_items`), plus `is_trash`/`deleted_at`/`updated_at` and the set of
+transcript `(id, source)` pairs. The at-rest format (`v1:<iv>:<tag>:<ciphertext>`)
+draws a random IV on every encryption, so _any_ re-encryption of a field --
+whatever changed inside it -- necessarily changes its IV; comparing just
+that segment is a correct, decrypt-free change signal. A prefix is enough:
+`ivStampOf`/`jsonIvStampOf` (`crypto.ts`) never look past the IV's own
+position, so a `left(column, IV_STAMP_PREFIX_LEN)` prefix and the full
+column value give the identical stamp for the same row (a unit test asserts
+this equivalence directly, since it's the one invariant the whole scheme
+depends on -- phase 1 and phase 2 must never disagree about a row that
+didn't change). `updated_at` alone can't do this job on its own: nothing
+guarantees Riffado bumps `recordings.updated_at` when a child row's summary
+or transcript changes, and `transcriptions`/`ai_enhancements` carry no
+`updated_at` at all -- so it's included in the stamp as defense in depth,
+never as the sole signal.
+
+Comparing each stamp to the previous refresh's stamp for that id splits the
+corpus into unchanged ids (reused **by reference** -- no decrypt, no
+re-normalize) and new/changed ids.
+
+**Phase 2** (`METADATA_QUERY`, always `WHERE r.id = ANY($1)`) fetches full
+metadata -- title/summary/key points/action items/transcript descriptors,
+and only now touches any ciphertext -- for exactly those changed/new ids,
+and is skipped entirely (no query at all) when nothing changed. The very
+first refresh (cold start, or right after `invalidate()`, which drops the
+stamps too) has no previous stamp to compare against, so every id counts as
+new and phase 2 fetches the whole corpus once -- functionally the old
+single-query refresh, plus phase 1's cheap round trip.
+
+A field that isn't the `v1:` shape (never encrypted, or a different jsonb
+wrapper) has no IV a bare prefix can verify -- unlike a full value, a
+prefix can't fall back to "compare the rest of the value too." Rather than
+risk a false "unchanged," `ivStampOf`/`jsonIvStampOf` return a fresh marker
+on every call for that shape, so the recording is always routed through
+phase 2 and rebuilt -- a correctness-preserving fallback, not free, but
+never wrong. This is a real cost only for rows actually written that way;
+on this deployment `riffado-db`'s `key_points`/`action_items` are the
+encrypted wrapper and `filename`/`summary` are `v1:` for every row (checked
+directly), so it doesn't apply to any current recording -- it exists for
+whatever shape a future migration or import path might produce, and the
+integration suite keeps one test (`rec-active`, deliberately seeded with
+plain jsonb) proving the fallback itself, not just asserting it in the
+abstract.
+
+Numbers: [`docs/performance.md`](./performance.md).
+
 ## `riffado_search` is two-stage
 
 Stage 1 (`rankByCheapFields`) scores every recording's pre-normalized
