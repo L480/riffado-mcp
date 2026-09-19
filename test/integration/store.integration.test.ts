@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { createPool } from "../../src/riffado/db.js"
 import { parseEncryptionKey } from "../../src/riffado/crypto.js"
 import { RecordingStore } from "../../src/riffado/store.js"
-import { migrate, seed, TEST_ENCRYPTION_KEY } from "./seed.js"
+import { encJson, encryptForTest, migrate, seed, TEST_ENCRYPTION_KEY } from "./seed.js"
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL
 
@@ -120,5 +120,157 @@ describe.skipIf(!TEST_DATABASE_URL)("RecordingStore against a real Postgres", ()
     await expect(pool.query("DELETE FROM recordings WHERE id = 'rec-active'")).rejects.toThrow(
       /read-only/i,
     )
+  })
+
+  // From here on: incremental refresh against a real Postgres, using
+  // `setupClient` (unrestricted) to mutate rows exactly like Riffado itself
+  // would, then re-querying through the app's own store. `store` was built
+  // with `cacheTtlMs: 0`, so every `get()` re-runs refresh().
+  //
+  // These tests target a purpose-seeded "rec-stamp" recording -- fully
+  // v1:-encrypted in all four stamped fields (filename, summary, and both
+  // key_points/action_items as the encrypted jsonb wrapper) -- rather than
+  // `rec-active`. `rec-active` deliberately has *plain* (unwrapped)
+  // key_points (see seed.ts) to exercise that jsonb shape elsewhere; under
+  // phase 1's prefix-only stamp, a plain/unwrapped field can never be
+  // verified unchanged from a prefix alone, so `rec-active` is always
+  // rebuilt regardless of what these tests do -- see the last test below,
+  // which asserts exactly that instead of fighting it.
+  describe("incremental refresh", () => {
+    beforeAll(async () => {
+      await setupClient.query(
+        `INSERT INTO recordings (id, user_id, filename, duration, start_time, is_trash, deleted_at)
+         VALUES ($1, $2, $3, $4, $5, false, NULL)`,
+        ["rec-stamp", "u1", encryptForTest("Stamp Test Recording"), 60000, "2026-09-16 08:00:00"],
+      )
+      await setupClient.query(
+        `INSERT INTO transcriptions (id, recording_id, user_id, text, provider, model, detected_language, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          "t-stamp-riffado",
+          "rec-stamp",
+          "u1",
+          encryptForTest("Ursprünglicher Transkripttext."),
+          "openai",
+          "whisper-1",
+          "de",
+          "riffado",
+        ],
+      )
+      await setupClient.query(
+        `INSERT INTO ai_enhancements (id, recording_id, user_id, summary, key_points, action_items, provider, model, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          "e-stamp",
+          "rec-stamp",
+          "u1",
+          encryptForTest("Ursprüngliche Zusammenfassung."),
+          encJson(["Ursprünglicher Punkt"]), // encrypted-wrapper jsonb -- unlike rec-active's plain array
+          encJson([{ who: "Nico", what: "Ursprüngliche Aktion" }]),
+          "openai",
+          "gpt-4o-mini",
+          "riffado",
+        ],
+      )
+    })
+
+    it("an unchanged second refresh reuses the cached recording object verbatim", async () => {
+      const first = await store.get()
+      const firstStamp = first.find((r) => r.id === "rec-stamp")!
+
+      const second = await store.get()
+      const secondStamp = second.find((r) => r.id === "rec-stamp")!
+
+      expect(secondStamp).toBe(firstStamp)
+    })
+
+    it("re-encrypting a summary is noticed and rebuilds just that recording", async () => {
+      const before = (await store.get()).find((r) => r.id === "rec-stamp")!
+
+      await setupClient.query("UPDATE ai_enhancements SET summary = $1 WHERE recording_id = $2", [
+        encryptForTest("Neue Zusammenfassung nach Re-Encryption."),
+        "rec-stamp",
+      ])
+
+      const after = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(after).not.toBe(before)
+      expect(after.summary).toBe("Neue Zusammenfassung nach Re-Encryption.")
+
+      // Restore, then confirm the store settles back into reusing it (not stuck rebuilding).
+      await setupClient.query("UPDATE ai_enhancements SET summary = $1 WHERE recording_id = $2", [
+        encryptForTest("Ursprüngliche Zusammenfassung."),
+        "rec-stamp",
+      ])
+      const restored = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(restored.summary).toBe("Ursprüngliche Zusammenfassung.")
+      const restoredAgain = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(restoredAgain).toBe(restored) // reused once settled, not permanently forced to rebuild
+    })
+
+    it("a re-encrypted key_points/action_items jsonb wrapper is noticed", async () => {
+      const before = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(before.keyPoints).toEqual(["Ursprünglicher Punkt"])
+
+      await setupClient.query(
+        "UPDATE ai_enhancements SET key_points = $1 WHERE recording_id = $2",
+        [encJson(["Neuer Punkt"]), "rec-stamp"],
+      )
+
+      const after = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(after).not.toBe(before)
+      expect(after.keyPoints).toEqual(["Neuer Punkt"])
+    })
+
+    it("an added transcript source is noticed", async () => {
+      const before = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(before.transcripts.map((t) => t.source)).toEqual(["riffado"])
+
+      await setupClient.query(
+        `INSERT INTO transcriptions (id, recording_id, user_id, text, provider, model, detected_language, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          "t-stamp-extra",
+          "rec-stamp",
+          "u1",
+          encryptForTest("Zusätzliche Quelle."),
+          "human",
+          "n/a",
+          "de",
+          "extra",
+        ],
+      )
+
+      const after = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(after).not.toBe(before)
+      expect(after.transcripts.map((t) => t.source).sort()).toEqual(["extra", "riffado"])
+    })
+
+    it("a removed transcript source is noticed", async () => {
+      const before = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(before.transcripts.map((t) => t.source)).toContain("extra")
+
+      await setupClient.query("DELETE FROM transcriptions WHERE id = $1", ["t-stamp-extra"])
+
+      const after = (await store.get()).find((r) => r.id === "rec-stamp")!
+      expect(after).not.toBe(before)
+      expect(after.transcripts.map((t) => t.source)).toEqual(["riffado"])
+    })
+
+    it("invalidate() forces a full rebuild even with nothing changed", async () => {
+      const before = (await store.get()).find((r) => r.id === "rec-stamp")!
+      store.invalidate()
+      const after = (await store.get()).find((r) => r.id === "rec-stamp")!
+
+      expect(after).not.toBe(before)
+      expect(after).toEqual(before)
+    })
+
+    it("a recording with plain (unwrapped) key_points -- rec-active -- is always rebuilt, never reused, since a prefix can't verify a plain jsonb value unchanged", async () => {
+      const first = (await store.get()).find((r) => r.id === "rec-active")!
+      const second = (await store.get()).find((r) => r.id === "rec-active")!
+
+      expect(second).not.toBe(first)
+      expect(second).toEqual(first) // still correct content, just never cheaply verified unchanged
+    })
   })
 })

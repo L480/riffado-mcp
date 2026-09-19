@@ -19,7 +19,9 @@ export function encryptForTest(plain: string, hexKey: string = TEST_ENCRYPTION_K
   return `v1:${iv.toString("hex")}:${tag.toString("hex")}:${ciphertext.toString("hex")}`
 }
 
-function encJson(value: unknown): string {
+/** Encrypted-wrapper jsonb shape: `{"c": "<v1:...>"}` -- exported so other test files can
+ * seed a fully-encrypted key_points/action_items row of their own. */
+export function encJson(value: unknown): string {
   return JSON.stringify({ c: encryptForTest(JSON.stringify(value)) })
 }
 
