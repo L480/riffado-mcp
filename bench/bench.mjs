@@ -1,10 +1,11 @@
-// v0.1.0 two-stage-store benchmark. Imports the shipped dist/ output
+// v0.2.0 two-stage-store benchmark. Imports the shipped dist/ output
 // directly, against a throwaway Postgres (see README.md — port 5544,
 // tmpfs). Never touches a real database.
 //   npm run build && REPS=20 node --expose-gc bench.mjs <N>
 import pg from "pg"
 import path from "path"
 import { fileURLToPath } from "url"
+import { encryptForTest, randomSummary } from "./seed-lib.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DIST = path.join(__dirname, "../dist/riffado")
@@ -15,6 +16,7 @@ const { sliceText } = await import(`${DIST}/format.js`)
 
 const N = parseInt(process.argv[2] ?? "1000", 10)
 const REPS = parseInt(process.env.REPS ?? "20", 10)
+const CHANGED_COUNT = Math.min(10, N)
 const ENCRYPTION_KEY = Buffer.from("11".repeat(32), "hex")
 
 function percentile(sorted, p) {
@@ -98,7 +100,54 @@ async function main() {
   gc()
   const afterCold = mem()
 
+  // Same cached snapshot as the cold get() above (well within cacheTtlMs) -- no extra query.
   const normalizedFieldsById = await store.getNormalizedFields()
+
+  // 1b) unchanged refresh: the corpus hasn't changed, so every recording's stamp should
+  // match and refresh() should reuse every cached entry -- no decrypt, no re-normalize.
+  // `store.cachedAt` is a bench-only reach into the store's TTL bookkeeping (present in the
+  // compiled dist/ output even though the TS source marks it `private`) to force refresh()
+  // to run again while the previous snapshot -- and its stamps -- survives; `invalidate()`
+  // would drop the stamps too and defeat the point of this measurement.
+  store.cachedAt = 0
+  const u0 = performance.now()
+  const recordingsUnchanged = await store.get()
+  const unchangedTotalMs = performance.now() - u0
+  const unchangedSqlMs = lastSqlMs
+  const unchangedDecryptBuildMs = unchangedTotalMs - unchangedSqlMs
+  const reusedAll =
+    recordingsUnchanged.length === recordings.length &&
+    recordingsUnchanged.every((r, i) => r === recordings[i])
+
+  gc()
+  const afterUnchanged = mem()
+
+  // 1c) refresh after mutating a handful of recordings: re-encrypts (fresh IV) a few
+  // summaries directly against the bench Postgres -- same at-rest format Riffado itself
+  // writes -- then times a refresh that must rebuild just those, reusing the rest.
+  const changedIds = Array.from({ length: CHANGED_COUNT }, (_, i) => `rec-${i}`)
+  for (const id of changedIds) {
+    const i = Number(id.slice(4))
+    await pool.query("UPDATE ai_enhancements SET summary = $1 WHERE recording_id = $2", [
+      encryptForTest(`${randomSummary(i)} (edited for bench)`),
+      id,
+    ])
+  }
+
+  store.cachedAt = 0
+  const c0 = performance.now()
+  const recordingsChanged = await store.get()
+  const changedTotalMs = performance.now() - c0
+  const changedSqlMs = lastSqlMs
+  const changedDecryptBuildMs = changedTotalMs - changedSqlMs
+  const changedById = new Map(recordingsChanged.map((r) => [r.id, r]))
+  const unchangedById = new Map(recordingsUnchanged.map((r) => [r.id, r]))
+  const rebuiltCount = changedIds.filter(
+    (id) => changedById.get(id) !== unchangedById.get(id),
+  ).length
+
+  gc()
+  const afterChanged = mem()
 
   // 2) search latency, worst case ("ubergabe" is in every title -- see seed.mjs, and
   // README.md's pitfall note) and realistic case ("warmepumpe" is one of ten topics,
@@ -152,15 +201,34 @@ async function main() {
     JSON.stringify(
       {
         N,
+        changedCount: CHANGED_COUNT,
         cachedCount: store.getCachedCount(),
-        cold: { totalMs: coldTotalMs, sqlMs: coldSqlMs, decryptBuildMs: coldDecryptBuildMs },
+        refresh: {
+          cold: { totalMs: coldTotalMs, sqlMs: coldSqlMs, decryptBuildMs: coldDecryptBuildMs },
+          unchanged: {
+            totalMs: unchangedTotalMs,
+            sqlMs: unchangedSqlMs,
+            decryptBuildMs: unchangedDecryptBuildMs,
+            reusedAllReferenceIdentical: reusedAll,
+          },
+          changed: {
+            totalMs: changedTotalMs,
+            sqlMs: changedSqlMs,
+            decryptBuildMs: changedDecryptBuildMs,
+            rebuiltCount,
+          },
+        },
         memory: {
           baselineRssMB: baseline.rssMB,
           baselineHeapUsedMB: baseline.heapUsedMB,
           afterColdRssMB: afterCold.rssMB,
           afterColdHeapUsedMB: afterCold.heapUsedMB,
+          afterUnchangedRssMB: afterUnchanged.rssMB,
+          afterChangedRssMB: afterChanged.rssMB,
           deltaRssMB: afterCold.rssMB - baseline.rssMB,
           deltaHeapUsedMB: afterCold.heapUsedMB - baseline.heapUsedMB,
+          deltaUnchangedRefreshRssMB: afterUnchanged.rssMB - afterCold.rssMB,
+          deltaChangedRefreshRssMB: afterChanged.rssMB - afterUnchanged.rssMB,
         },
         search: searchResults,
         getRecordingTranscript: {

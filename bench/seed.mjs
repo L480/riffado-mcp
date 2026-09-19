@@ -63,8 +63,12 @@ async function main() {
       )
 
       const summary = encryptForTest(randomSummary(i))
-      const keyPoints = JSON.stringify(randomKeyPoints(i)) // plain jsonb, matches rec-active fixture
-      const actionItems = encJson(randomActionItems(i)) // encrypted-wrapper jsonb
+      // Both encrypted-wrapper jsonb -- the normal production shape (docs/architecture.md:
+      // these columns are ciphertext at rest). Plain/unwrapped key_points (as in the
+      // integration fixture's rec-active) is a real but non-default shape, covered by its
+      // own dedicated store test -- see docs/performance.md's incremental-refresh section.
+      const keyPoints = encJson(randomKeyPoints(i))
+      const actionItems = encJson(randomActionItems(i))
       aiParams.push(
         `e-${i}`,
         id,
