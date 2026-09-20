@@ -51,10 +51,10 @@ Things you can ask Claude once the server is connected:
 
 - "What did I record yesterday?"
 - "Find every recording where I talked about the Q3 budget."
-- "Search deeply through all transcripts for 'Meier contract' — this might not show up in summaries."
+- "Do a deep search (`deep: true`) through all transcripts for 'Meier contract' — this might not show up in summaries."
 - "What action items came out of my recordings this week?"
 - "Summarize the recording titled 'Standup 09/12'."
-- "Give me the full transcript of my last call with Sarah."
+- "Give me the transcript of my last call with Sarah." (paged in slices for long recordings)
 - "How many recordings do I have, and what's my average recording length?"
 - "List all my recordings from March 2025 with their summaries."
 - "Did I ever mention 'renewal deadline' in any recording?"
