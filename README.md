@@ -50,16 +50,28 @@ ASR misreads, never fill gaps from general knowledge).
 Things you can ask Claude once the server is connected:
 
 - "What did I record yesterday?"
-- "Find every recording where I talked about the Q3 budget."
-- "Do a deep search (`deep: true`) through all transcripts for 'Meier contract' — this might not show up in summaries."
 - "What action items came out of my recordings this week?"
-- "Summarize the recording titled 'Standup 09/12'."
 - "Give me the transcript of my last call with Sarah." (paged in slices for long recordings)
 - "How many recordings do I have, and what's my average recording length?"
-- "List all my recordings from March 2025 with their summaries."
-- "Did I ever mention 'renewal deadline' in any recording?"
 - "Which of my recordings don't have a transcript yet?"
-- "Pull up all open action items across all recordings, grouped by recording."
+
+More complex, research-style questions Claude can answer by combining
+several tool calls (search → pull the matching recordings → read/quote
+transcripts):
+
+- "Across all my calls with customer Acme, what's the recurring technical
+  pain point they keep bringing up?"
+- "What does customer Acme's current tool stack look like, based on
+  everything they've mentioned across our calls?"
+- "When does Acme's contract expire, and did we discuss a renewal date in
+  any recent call?"
+- "Do a deep search (`deep: true`) through all transcripts for 'Meier
+  contract' — this might not show up in summaries — and tell me what was
+  agreed."
+- "Compare what customer X and customer Y said about pricing across all
+  our calls with them — where do their objections differ?"
+- "Build a timeline of everything discussed with Acme this quarter, with
+  dates and direct quotes."
 
 ## Environment variables
 
