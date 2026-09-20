@@ -45,6 +45,34 @@ Also: resource `riffado://index` (markdown index), resource template
 rules — cite date+title, quote verbatim, transcript beats AI summary, flag
 ASR misreads, never fill gaps from general knowledge).
 
+## Example questions
+
+Things you can ask Claude once the server is connected:
+
+- "What did I record yesterday?"
+- "What action items came out of my recordings this week?"
+- "Give me the transcript of my last call with Sarah." (paged in slices for long recordings)
+- "How many recordings do I have, and what's my average recording length?"
+- "Which of my recordings don't have a transcript yet?"
+
+More complex, research-style questions Claude can answer by combining
+several tool calls (search → pull the matching recordings → read/quote
+transcripts):
+
+- "Across all my calls with customer Acme, what's the recurring technical
+  pain point they keep bringing up?"
+- "What does customer Acme's current tool stack look like, based on
+  everything they've mentioned across our calls?"
+- "When does Acme's contract expire, and did we discuss a renewal date in
+  any recent call?"
+- "Do a deep search (`deep: true`) through all transcripts for 'Meier
+  contract' — this might not show up in summaries — and tell me what was
+  agreed."
+- "Compare what customer X and customer Y said about pricing across all
+  our calls with them — where do their objections differ?"
+- "Build a timeline of everything discussed with Acme this quarter, with
+  dates and direct quotes."
+
 ## Environment variables
 
 | Var                       | Default                           | Notes                                                                                                       |
