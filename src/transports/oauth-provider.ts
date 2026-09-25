@@ -110,7 +110,10 @@ export function redirectUriRejection(
   if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
     return "must use https (http is only allowed for loopback hosts)"
   }
-  if (parsed.username !== "" || parsed.password !== "") {
+  // WHATWG URL drops an *empty* userinfo ("https://@claude.ai/"), leaving
+  // username/password blank, so also look for "@" in the raw authority.
+  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(redirectUri)?.[1] ?? ""
+  if (parsed.username !== "" || parsed.password !== "" || authority.includes("@")) {
     return "must not contain userinfo"
   }
   if (redirectUri.includes("#")) {

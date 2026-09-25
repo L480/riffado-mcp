@@ -366,6 +366,7 @@ export class RecordingStore {
       }
     }
 
+    const fetched = new Set(toFetch)
     const recordings: Recording[] = []
     const recordingsById = new Map<string, Recording>()
     const normalizedFieldsById = new Map<string, NormalizedCheapFields>()
@@ -378,7 +379,10 @@ export class RecordingStore {
       if (rebuilt) {
         rec = rebuilt
         normalized = normalizedCheapFieldsFor(rec)
-      } else {
+      } else if (!fetched.has(id)) {
+        // Only unchanged ids reuse the previous snapshot. A changed id that
+        // failed to rebuild (corrupt ciphertext/JSON) or vanished between
+        // phase 1 and phase 2 must not fall back to its stale copy.
         rec = previous?.recordingsById.get(id)
         normalized = previous?.normalizedFieldsById.get(id)
         if (rec && normalized) {

@@ -461,6 +461,35 @@ describe("RecordingStore per-recording error isolation", () => {
     errorSpy.mockRestore()
   })
 
+  it("a cached recording that turns undecryptable is dropped, not served from the stale snapshot", async () => {
+    const f1 = fixture({ summary: encryptForTest("Old summary") })
+    const newSummary = encryptForTest("New summary")
+    const f2 = fixture({ summary: newSummary })
+    const { pool } = fakePool({
+      stamp: [[f1.stamp], [f2.stamp]], // IV changed -> rec-1 is re-fetched
+      metadata: [[f1.meta], [{ ...f2.meta, summary: corruptedSameIv(newSummary) }]],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    expect((await store.get()).map((r) => r.summary)).toEqual(["Old summary"])
+    expect(await store.get()).toEqual([])
+
+    errorSpy.mockRestore()
+  })
+
+  it("a changed recording that vanishes between phase 1 and phase 2 is dropped, not served stale", async () => {
+    const f1 = fixture({ summary: encryptForTest("Old summary") })
+    const f2 = fixture({ summary: encryptForTest("New summary") })
+    const { pool } = fakePool({ stamp: [[f1.stamp], [f2.stamp]], metadata: [[f1.meta], []] })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    vi.spyOn(console, "error").mockImplementation(() => {})
+
+    await store.get()
+    expect(await store.get()).toEqual([])
+    vi.restoreAllMocks()
+  })
+
   it("a recording with invalid JSON in key_points is skipped, not fatal to the refresh", async () => {
     const bad = fixture({
       id: "rec-bad-json",

@@ -230,6 +230,8 @@ describe("StaticTokenOAuthProvider redirect URI allowlist", () => {
     ["https://evil.example/cb", "not in HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS"],
     ["https://claude.ai@evil.example/cb", "must not contain userinfo"],
     ["https://user:pw@claude.ai/cb", "must not contain userinfo"],
+    ["https://@claude.ai/cb", "must not contain userinfo"],
+    ["https://:@claude.ai/cb", "must not contain userinfo"],
     ["https://claude.ai.evil.example/cb", "not in HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS"],
     ["https://evil.example/claude.ai", "not in HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS"],
     ["https://claude.ai./cb", "not in HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS"],
