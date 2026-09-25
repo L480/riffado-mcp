@@ -83,9 +83,9 @@ transcripts):
 | `RIFFADO_APP_URL`         | —                                 | e.g. `https://riffado.example.com` → deep links in tool output                                              |
 | `TRANSPORT`               | `stdio`                           | `stdio` \| `http`                                                                                           |
 | `HTTP_PORT` / `HTTP_HOST` | `3000` / `localhost`              | container sets host `0.0.0.0`                                                                               |
-| `HTTP_AUTH_TOKEN`         | —                                 | shared secret, min 32 chars when set; unset = HTTP transport runs **unauthenticated** (loud warning logged) |
+| `HTTP_AUTH_TOKEN`         | _required for `http`_             | shared secret, min 32 chars; the HTTP transport refuses to start without it (unused on `stdio`)             |
 | `HTTP_AUTH_HEADER_NAME`   | `x-mcp-token`                     |                                                                                                             |
-| `HTTP_OAUTH_ENABLED`      | `true`                            | only effective with a token set                                                                             |
+| `HTTP_OAUTH_ENABLED`      | `true`                            | wraps `HTTP_AUTH_TOKEN` in an OAuth 2.1 login flow for Claude connectors                                    |
 | `HTTP_PUBLIC_URL`         | —                                 | OAuth issuer; must be HTTPS unless `localhost`                                                              |
 | `HTTP_OAUTH_STATE_FILE`   | `~/.riffado-mcp-oauth-state.json` | container: `/app/data/oauth-state.json`                                                                     |
 | `HTTP_TRUST_PROXY`        | `1`                               | Express `trust proxy`                                                                                       |
@@ -98,8 +98,7 @@ transcripts):
 `GET /health` is the one route auth never gates — liveness only:
 `{ status, timestamp }`. `GET /health/details` adds session count, DB
 reachability and the cached recording count, and requires the same
-auth as every other route (shared token/OAuth, or open if
-`HTTP_AUTH_TOKEN` is unset).
+auth as every other route (shared token or OAuth).
 
 ## Quickstart: Claude Code (stdio)
 

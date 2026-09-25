@@ -19,9 +19,9 @@ This server hands an LLM client the full text of private voice recordings.
 That makes the deployment, not just the code, part of the security surface:
 
 - **`HTTP_AUTH_TOKEN` is the only thing protecting the HTTP transport.** Make
-  it a long random secret — at least 32 characters, enforced at startup. If
-  it is unset, the HTTP transport serves every request unauthenticated — the
-  server logs a loud warning, but it will run.
+  it a long random secret — at least 32 characters, enforced at startup. It is
+  mandatory with `TRANSPORT=http`: there is no unauthenticated mode, and the
+  server refuses to start without it.
 - **`GET /health` is liveness-only and unauthenticated by design** (status +
   timestamp, nothing else). Session count, DB reachability and cached
   recording count live at `GET /health/details`, which requires the same

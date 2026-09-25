@@ -26,10 +26,16 @@ async function main(): Promise<void> {
   let transport: RiffadoTransportServer
 
   if (config.TRANSPORT === "http") {
+    // loadConfig() already rejects TRANSPORT=http without a token; this
+    // narrows the type and keeps the invariant local.
+    const authToken = config.HTTP_AUTH_TOKEN
+    if (!authToken) {
+      throw new Error("HTTP_AUTH_TOKEN is required when TRANSPORT=http")
+    }
     transport = new StreamableHttpServer({
       port: config.HTTP_PORT,
       host: config.HTTP_HOST,
-      authToken: config.HTTP_AUTH_TOKEN,
+      authToken,
       authHeaderName: config.HTTP_AUTH_HEADER_NAME,
       oauthEnabled: config.HTTP_OAUTH_ENABLED,
       publicUrl: config.HTTP_PUBLIC_URL,

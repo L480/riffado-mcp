@@ -71,10 +71,29 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...BASE_ENV, TRANSPORT: "carrier-pigeon" })).toThrow()
   })
 
-  describe("HTTP_AUTH_TOKEN minimum length", () => {
-    it("leaves it unset when absent (unauthenticated HTTP transport stays a valid config)", () => {
+  describe("HTTP_AUTH_TOKEN", () => {
+    it("is optional for the stdio transport", () => {
       const config = loadConfig(BASE_ENV)
       expect(config.HTTP_AUTH_TOKEN).toBeUndefined()
+    })
+
+    it("is required for the HTTP transport (no unauthenticated mode)", () => {
+      expect(() => loadConfig({ ...BASE_ENV, TRANSPORT: "http" })).toThrow(
+        /HTTP_AUTH_TOKEN is required when TRANSPORT=http/,
+      )
+    })
+
+    it("accepts the HTTP transport with a valid token", () => {
+      const token = "a".repeat(32)
+      const config = loadConfig({ ...BASE_ENV, TRANSPORT: "http", HTTP_AUTH_TOKEN: token })
+      expect(config.TRANSPORT).toBe("http")
+      expect(config.HTTP_AUTH_TOKEN).toBe(token)
+    })
+
+    it("rejects a short token on the HTTP transport too", () => {
+      expect(() =>
+        loadConfig({ ...BASE_ENV, TRANSPORT: "http", HTTP_AUTH_TOKEN: "a".repeat(31) }),
+      ).toThrow(/at least 32 characters/)
     })
 
     it("rejects a token shorter than 32 characters", () => {

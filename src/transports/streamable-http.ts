@@ -29,7 +29,9 @@ export interface HealthDetails {
 export interface StreamableHttpServerOptions {
   port?: number
   host?: string
-  authToken?: string
+  /** Shared secret gating every route except `/health`. Required: there is
+   * no unauthenticated mode. */
+  authToken: string
   authHeaderName?: string
   /** Wraps `authToken` in an OAuth 2.1 flow for OAuth-only clients (Claude's
    * custom connectors offer no static-token field). Defaults to `true`. */
@@ -82,6 +84,11 @@ export class StreamableHttpServer implements RiffadoTransportServer {
   private resourceMetadataUrl?: string
 
   constructor(options: StreamableHttpServerOptions) {
+    // Guards untyped callers too: an empty token would otherwise make the
+    // auth middleware compare against "" rather than fail closed.
+    if (typeof options.authToken !== "string" || options.authToken.length === 0) {
+      throw new Error("StreamableHttpServer requires a non-empty authToken")
+    }
     this.options = {
       port: 3000,
       host: "localhost",
@@ -159,54 +166,44 @@ export class StreamableHttpServer implements RiffadoTransportServer {
 
     this.setupOAuth()
 
-    if (this.options.authToken) {
-      this.app.use((req: Request, res: Response, next: NextFunction) => {
-        if (req.path === "/health") {
+    this.app.use((req: Request, res: Response, next: NextFunction) => {
+      if (req.path === "/health") {
+        return next()
+      }
+
+      const headerName = this.options.authHeaderName ?? "x-mcp-token"
+      const headerToken = req.header(headerName)
+      const authorizationHeader = req.header("authorization")
+      const bearerToken =
+        typeof authorizationHeader === "string" && authorizationHeader.startsWith("Bearer ")
+          ? authorizationHeader.slice(7)
+          : undefined
+
+      const staticTokenValid =
+        this.compareAuthTokens(headerToken) ||
+        (bearerToken !== undefined && this.compareAuthTokens(bearerToken))
+      if (staticTokenValid) {
+        return next()
+      }
+
+      if (this.oauthProvider && bearerToken !== undefined) {
+        const authInfo = this.oauthProvider.getValidAccessToken(bearerToken)
+        if (authInfo) {
+          req.auth = authInfo
           return next()
         }
+      }
 
-        const headerName = this.options.authHeaderName ?? "x-mcp-token"
-        const headerToken = req.header(headerName)
-        const authorizationHeader = req.header("authorization")
-        const bearerToken =
-          typeof authorizationHeader === "string" && authorizationHeader.startsWith("Bearer ")
-            ? authorizationHeader.slice(7)
-            : undefined
+      // RFC 9728: point compatible clients at OAuth discovery.
+      if (this.resourceMetadataUrl) {
+        res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${this.resourceMetadataUrl}"`)
+      }
 
-        const staticTokenValid =
-          this.compareAuthTokens(headerToken) ||
-          (bearerToken !== undefined && this.compareAuthTokens(bearerToken))
-        if (staticTokenValid) {
-          return next()
-        }
-
-        if (this.oauthProvider && bearerToken !== undefined) {
-          const authInfo = this.oauthProvider.getValidAccessToken(bearerToken)
-          if (authInfo) {
-            req.auth = authInfo
-            return next()
-          }
-        }
-
-        // RFC 9728: point compatible clients at OAuth discovery.
-        if (this.resourceMetadataUrl) {
-          res.setHeader(
-            "WWW-Authenticate",
-            `Bearer resource_metadata="${this.resourceMetadataUrl}"`,
-          )
-        }
-
-        return res.status(401).json({
-          error: "Unauthorized",
-          message: "Missing or invalid authentication token. Provide a valid auth header.",
-        })
+      return res.status(401).json({
+        error: "Unauthorized",
+        message: "Missing or invalid authentication token. Provide a valid auth header.",
       })
-    } else {
-      console.error(
-        "WARNING: HTTP_AUTH_TOKEN is not set — the HTTP transport is running UNAUTHENTICATED. " +
-          "Set HTTP_AUTH_TOKEN before exposing this server.",
-      )
-    }
+    })
 
     this.app.use((_req: Request, res: Response, next: NextFunction) => {
       const timeout = setTimeout(() => {
@@ -243,7 +240,7 @@ export class StreamableHttpServer implements RiffadoTransportServer {
   }
 
   private compareAuthTokens(token: string | undefined): boolean {
-    if (!this.options.authToken || typeof token !== "string") {
+    if (typeof token !== "string") {
       return false
     }
     const provided = Buffer.from(token)
@@ -263,12 +260,12 @@ export class StreamableHttpServer implements RiffadoTransportServer {
 
   /**
    * Mounts the OAuth 2.1 authorization server wrapping the shared token.
-   * Skipped when there's no shared token or OAuth is disabled. If a valid
-   * issuer URL can't be formed, OAuth is disabled with an actionable log
-   * message while shared-token auth keeps working.
+   * Skipped when OAuth is disabled. If a valid issuer URL can't be formed,
+   * OAuth is disabled with an actionable log message while shared-token
+   * auth keeps working.
    */
   private setupOAuth(): void {
-    if (!this.options.authToken || this.options.oauthEnabled === false) {
+    if (this.options.oauthEnabled === false) {
       return
     }
 
