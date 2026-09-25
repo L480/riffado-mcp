@@ -358,6 +358,45 @@ describe("StreamableHttpServer OAuth flow", () => {
     expect(res.statusCode).not.toBe(404)
   })
 
+  it("rejects registering a redirect URI outside the allowlist (no open redirect)", async () => {
+    const registerRes = await request(port, "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["https://evil.example/cb"],
+        token_endpoint_auth_method: "none",
+      }),
+    })
+    expect(registerRes.statusCode).toBe(400)
+    expect(JSON.parse(registerRes.body).error).toBe("invalid_redirect_uri")
+  })
+
+  it("answers a registration over capacity with a 4xx, not a 500", async () => {
+    // Private state access for test: seeding 100 real logins would need 100
+    // authorize round-trips against the 30-per-window OAuth rate limit.
+    const provider = (server as unknown as { oauthProvider: unknown }).oauthProvider as {
+      clients: Map<string, unknown>
+      refreshTokens: Map<string, unknown>
+    }
+    // Fill the registry with clients that each hold a live grant.
+    const now = Math.floor(Date.now() / 1000)
+    for (let i = 0; i < 100; i++) {
+      const id = `held-${i}`
+      provider.clients.set(id, { client_id: id, redirect_uris: ["http://localhost/cb"] })
+      provider.refreshTokens.set(`h${i}`, { clientId: id, scopes: [], expiresAt: now + 60 })
+    }
+    const registerRes = await request(port, "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["http://localhost/callback"],
+        token_endpoint_auth_method: "none",
+      }),
+    })
+    expect(registerRes.statusCode).toBe(400)
+    expect(JSON.parse(registerRes.body).error).toBe("too_many_requests")
+  })
+
   it("handles the token endpoint behind a reverse proxy (X-Forwarded-For)", async () => {
     const proxyHeaders = { "X-Forwarded-For": "203.0.113.7", "X-Forwarded-Proto": "https" }
     const registerRes = await request(port, "/register", {

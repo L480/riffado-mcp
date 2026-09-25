@@ -183,4 +183,34 @@ describe("loadConfig", () => {
       )
     })
   })
+
+  describe("HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS", () => {
+    it("defaults to Claude's callback hosts plus loopback", () => {
+      expect(loadConfig(BASE_ENV).HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS).toEqual([
+        "claude.ai",
+        "claude.com",
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+      ])
+    })
+
+    it("parses a comma-separated list, normalising case, spaces, IPv6 and duplicates", () => {
+      expect(
+        loadConfig({
+          ...BASE_ENV,
+          HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS: " Claude.AI , ::1,claude.ai,,app.example.org",
+        }).HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS,
+      ).toEqual(["claude.ai", "[::1]", "app.example.org"])
+    })
+
+    it.each(["*", "*.example.org", "claude.ai:443", "https://claude.ai", " , ", "a@b"])(
+      "rejects %j",
+      (value) => {
+        expect(() => loadConfig({ ...BASE_ENV, HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS: value })).toThrow(
+          /HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS/,
+        )
+      },
+    )
+  })
 })

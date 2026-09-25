@@ -8,7 +8,7 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
 import express, { Request, Response, NextFunction } from "express"
 import cors from "cors"
-import { rateLimit } from "express-rate-limit"
+import { ipKeyGenerator, rateLimit, type RateLimitRequestHandler } from "express-rate-limit"
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js"
 import {
   mcpAuthRouter,
@@ -40,6 +40,9 @@ export interface StreamableHttpServerOptions {
   publicUrl?: string
   /** Where the OAuth provider persists clients + tokens across restarts. */
   oauthStateFile?: string
+  /** Hostnames OAuth clients may register redirect URIs for (see
+   * `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS`); the provider's default if unset. */
+  oauthAllowedRedirectHosts?: readonly string[]
   /** Express `trust proxy` setting (default `false`); set it (e.g. `1`)
    * behind a reverse proxy or the Cloudflare Tunnel. */
   trustProxy?: boolean | number | string
@@ -62,6 +65,17 @@ export interface StreamableHttpServerOptions {
   healthCheck?: () => Promise<HealthDetails>
 }
 
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000
+/** Failed authentications (401s) per IP per window before that IP is
+ * locked out with 429s, including for otherwise valid requests. */
+const FAILED_AUTH_LIMIT = 50
+/** Requests per IP per window once authenticated. */
+const AUTHENTICATED_LIMIT = 1000
+
+/** Rate-limit key: the client IP, with IPv6 collapsed to its /56 so one
+ * host can't rotate through its prefix to dodge the limit. */
+const ipKey = (req: Request): string => ipKeyGenerator(req.ip ?? "")
+
 class SessionError extends Error {
   constructor(
     message: string,
@@ -83,6 +97,21 @@ export class StreamableHttpServer implements RiffadoTransportServer {
   private readonly sessionTimeouts = new Map<string, NodeJS.Timeout>()
   private oauthProvider?: StaticTokenOAuthProvider
   private resourceMetadataUrl?: string
+  /**
+   * Counts failed authentications per IP. It's never mounted as ordinary
+   * middleware (that would count every request, and express-rate-limit's
+   * `skipSuccessfulRequests` still counts a request while it's in flight,
+   * so a handful of long-lived SSE streams would eat the budget): the auth
+   * middleware runs it only on the 401 path, and `rejectLockedOutClients`
+   * reads its counter up front.
+   */
+  private readonly failedAuthLimiter: RateLimitRequestHandler = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: FAILED_AUTH_LIMIT,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: ipKey,
+  })
 
   constructor(options: StreamableHttpServerOptions) {
     // Guards untyped callers too: an empty token would otherwise make the
@@ -105,6 +134,7 @@ export class StreamableHttpServer implements RiffadoTransportServer {
     this.port = this.options.port!
     this.host = this.options.host!
     this.app = express()
+    this.app.disable("x-powered-by")
 
     this.setupMiddleware()
     this.setupRoutes()
@@ -135,14 +165,16 @@ export class StreamableHttpServer implements RiffadoTransportServer {
       })
     }
 
-    this.app.use(
-      rateLimit({
-        windowMs: 15 * 60 * 1000,
-        limit: 300,
-        standardHeaders: true,
-        legacyHeaders: false,
-      }),
-    )
+    // An IP that already used up its failed-auth budget gets a 429 before
+    // any auth, OAuth or MCP work is done, even with valid credentials,
+    // until the window resets. /health is exempt: it's static and is what
+    // container/tunnel health checks poll.
+    this.app.use((req: Request, res: Response, next: NextFunction) => {
+      if (req.path === "/health") {
+        return next()
+      }
+      void this.rejectLockedOutClients(req, res, next).catch(next)
+    })
 
     // CORS before auth so OAuth discovery endpoints and preflight requests
     // are handled before auth kicks in.
@@ -165,7 +197,7 @@ export class StreamableHttpServer implements RiffadoTransportServer {
     this.app.use(
       ["/register", "/authorize", "/token"],
       rateLimit({
-        windowMs: 15 * 60 * 1000,
+        windowMs: RATE_LIMIT_WINDOW_MS,
         limit: 30,
         standardHeaders: true,
         legacyHeaders: false,
@@ -213,16 +245,41 @@ export class StreamableHttpServer implements RiffadoTransportServer {
         }
       }
 
-      // RFC 9728: point compatible clients at OAuth discovery.
-      if (this.resourceMetadataUrl) {
-        res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${this.resourceMetadataUrl}"`)
-      }
-
-      return res.status(401).json({
-        error: "Unauthorized",
-        message: "Missing or invalid authentication token. Provide a valid auth header.",
+      // Count the failure; past the budget the limiter answers 429 itself
+      // and never calls through to the 401 below.
+      void this.failedAuthLimiter(req, res, () => {
+        // RFC 9728: point compatible clients at OAuth discovery.
+        if (this.resourceMetadataUrl) {
+          res.setHeader(
+            "WWW-Authenticate",
+            `Bearer resource_metadata="${this.resourceMetadataUrl}"`,
+          )
+        }
+        res.status(401).json({
+          error: "Unauthorized",
+          message: "Missing or invalid authentication token. Provide a valid auth header.",
+        })
       })
     })
+
+    // Authenticated traffic gets a generous per-IP ceiling rather than none.
+    // Callers here already hold the shared secret or an OAuth token, so this
+    // isn't about guessing credentials: it bounds how hard a leaked token or
+    // a runaway client can drive the database (every tool call is a query +
+    // decryption). 1000 per 15 min (~1/s sustained) is far above what an
+    // interactive connector sends, so it never throttles normal use, unlike
+    // the old global 300 that authenticated MCP traffic shared with
+    // everything else. /health is skipped.
+    this.app.use(
+      rateLimit({
+        windowMs: RATE_LIMIT_WINDOW_MS,
+        limit: AUTHENTICATED_LIMIT,
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator: ipKey,
+        skip: (req) => req.path === "/health",
+      }),
+    )
 
     this.app.use((_req: Request, res: Response, next: NextFunction) => {
       const timeout = setTimeout(() => {
@@ -255,6 +312,26 @@ export class StreamableHttpServer implements RiffadoTransportServer {
         },
         id: null,
       })
+    })
+  }
+
+  /** 429s an IP whose failed-auth budget for the current window is spent. */
+  private async rejectLockedOutClients(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const hits = await this.failedAuthLimiter.getKey(ipKey(req))
+    if (!hits || hits.totalHits < FAILED_AUTH_LIMIT) {
+      return next()
+    }
+    if (hits.resetTime) {
+      const seconds = Math.max(1, Math.ceil((hits.resetTime.getTime() - Date.now()) / 1000))
+      res.setHeader("Retry-After", String(seconds))
+    }
+    res.status(429).json({
+      error: "Too Many Requests",
+      message: "Too many failed authentication attempts. Try again later.",
     })
   }
 
@@ -310,6 +387,7 @@ export class StreamableHttpServer implements RiffadoTransportServer {
         resource: resourceServerUrl.href,
         serverName: "Riffado MCP",
         stateFile: this.options.oauthStateFile,
+        allowedRedirectHosts: this.options.oauthAllowedRedirectHosts,
       })
 
       this.app.use(
@@ -459,15 +537,36 @@ export class StreamableHttpServer implements RiffadoTransportServer {
     this.cleanupSession(sessionId)
   }
 
+  /**
+   * Starts listening. Rejects if the listen itself fails (e.g. EADDRINUSE,
+   * EACCES). Express 5's `app.listen` also hands that error to the listen
+   * callback, so the callback must not treat being called as success.
+   */
   public async start(): Promise<void> {
-    return new Promise((resolve) => {
-      this.server = this.app.listen(this.port, this.host, () => {
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let startupError: Error | undefined
+      const fail = (err: Error) => {
+        if (err === startupError) {
+          return // same error delivered to both the callback and "error"
+        }
+        console.error(`Server error: ${err.message}`)
+        if (!settled) {
+          settled = true
+          startupError = err
+          reject(err)
+        }
+      }
+      this.server = this.app.listen(this.port, this.host, (err?: Error) => {
+        if (err) {
+          fail(err)
+          return
+        }
+        settled = true
         console.error(`riffado-mcp HTTP server running on http://${this.host}:${this.port}/mcp`)
         resolve()
       })
-      this.server.on("error", (err: Error) => {
-        console.error(`Server error: ${err.message}`)
-      })
+      this.server.on("error", fail)
     })
   }
 
