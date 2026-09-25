@@ -122,4 +122,57 @@ describe("loadConfig", () => {
       ).toBe(0)
     })
   })
+
+  describe("numeric env vars", () => {
+    it("parses valid integers (surrounding whitespace tolerated)", () => {
+      const config = loadConfig({
+        ...BASE_ENV,
+        HTTP_PORT: " 8080 ",
+        HTTP_SESSION_TIMEOUT_MS: "1000",
+        CACHE_TTL_MS: "5000",
+        DB_STATEMENT_TIMEOUT_MS: "2500",
+      })
+      expect(config.HTTP_PORT).toBe(8080)
+      expect(config.HTTP_SESSION_TIMEOUT_MS).toBe(1000)
+      expect(config.CACHE_TTL_MS).toBe(5000)
+      expect(config.DB_STATEMENT_TIMEOUT_MS).toBe(2500)
+    })
+
+    it.each(["", "abc", "3000abc", "1.5", "-1", "1e3", "0x10"])(
+      "rejects HTTP_PORT=%j instead of silently parseInt-ing it",
+      (value) => {
+        expect(() => loadConfig({ ...BASE_ENV, HTTP_PORT: value })).toThrow(/HTTP_PORT/)
+      },
+    )
+
+    it("bounds HTTP_PORT to 1-65535", () => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_PORT: "0" })).toThrow(/HTTP_PORT/)
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_PORT: "65536" })).toThrow(/HTTP_PORT/)
+      expect(loadConfig({ ...BASE_ENV, HTTP_PORT: "1" }).HTTP_PORT).toBe(1)
+      expect(loadConfig({ ...BASE_ENV, HTTP_PORT: "65535" }).HTTP_PORT).toBe(65535)
+    })
+
+    it("requires CACHE_TTL_MS and DB_STATEMENT_TIMEOUT_MS to be positive", () => {
+      expect(() => loadConfig({ ...BASE_ENV, CACHE_TTL_MS: "0" })).toThrow(/CACHE_TTL_MS/)
+      expect(() => loadConfig({ ...BASE_ENV, DB_STATEMENT_TIMEOUT_MS: "0" })).toThrow(
+        /DB_STATEMENT_TIMEOUT_MS/,
+      )
+      expect(() => loadConfig({ ...BASE_ENV, CACHE_TTL_MS: "-5" })).toThrow(/CACHE_TTL_MS/)
+    })
+
+    it("rejects timeouts above the 2^31-1 ms setTimeout limit", () => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "2147483648" })).toThrow(
+        /HTTP_SESSION_TIMEOUT_MS/,
+      )
+      expect(
+        loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "2147483647" }).HTTP_SESSION_TIMEOUT_MS,
+      ).toBe(2147483647)
+    })
+
+    it("rejects a non-integer HTTP_SESSION_TIMEOUT_MS", () => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "1h" })).toThrow(
+        /HTTP_SESSION_TIMEOUT_MS/,
+      )
+    })
+  })
 })
