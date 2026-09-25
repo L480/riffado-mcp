@@ -188,6 +188,22 @@ describe("riffado_search", () => {
     expect(structured.hits.map((h) => h.id)).toContain("rec-3")
   })
 
+  it("accepts a query at the length cap and rejects one over it", async () => {
+    const atCap = await client.callTool({
+      name: "riffado_search",
+      arguments: { query: "a".repeat(500) },
+    })
+    expect(atCap.isError).toBeFalsy()
+
+    const over = await client
+      .callTool({ name: "riffado_search", arguments: { query: "a".repeat(501) } })
+      .then(
+        (r) => r.isError === true,
+        () => true,
+      )
+    expect(over).toBe(true)
+  })
+
   it("reports the searched terms honestly when nothing matches", async () => {
     const result = await client.callTool({
       name: "riffado_search",

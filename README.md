@@ -40,6 +40,8 @@ The tool's response says explicitly when results were narrowed this way
 (i.e. whenever `deep` is `false`), so a client can tell a no-hit result from
 a real absence rather than assume one.
 
+`query` is capped at 500 characters.
+
 Also: resource `riffado://index` (markdown index), resource template
 `riffado://recording/{id}`, and prompt `riffado_ask` (carries the answering
 rules — cite date+title, quote verbatim, transcript beats AI summary, flag

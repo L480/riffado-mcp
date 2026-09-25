@@ -25,6 +25,9 @@ import {
 } from "../riffado/format.js"
 import type { ActionItemEntry, Recording, TranscriptText } from "../riffado/types.js"
 
+/** Upper bound on `riffado_search`'s `query` length. */
+export const MAX_SEARCH_QUERY_LENGTH = 500
+
 const SEARCH_TERM_HINT =
   "No stemming is applied — pass German *and* English variants of a term " +
   "(and names) to catch both, the way the /riffado slash command does."
@@ -128,7 +131,15 @@ export function registerRiffadoTools(server: McpServer, store: RecordingStore): 
         `phrase to search it as one term. ${SEARCH_TERM_HINT}`,
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
       inputSchema: {
-        query: z.string().min(1).describe('Search terms; "quoted phrases" match literally.'),
+        // Capped: every term is matched against every recording's text, so an
+        // unbounded query is an easy way to burn CPU on the whole corpus.
+        query: z
+          .string()
+          .min(1)
+          .max(MAX_SEARCH_QUERY_LENGTH)
+          .describe(
+            `Search terms; "quoted phrases" match literally. Max ${MAX_SEARCH_QUERY_LENGTH} characters.`,
+          ),
         scope: z.enum(["all", "transcript", "summary"]).default("all"),
         limit: z.number().int().min(1).max(50).default(10),
         from: z.string().optional().describe("ISO date (YYYY-MM-DD) lower bound on start_time."),
