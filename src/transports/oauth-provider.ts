@@ -92,6 +92,9 @@ interface StoredRefreshToken {
   expiresAt: number
 }
 
+/** Thrown when a state file from a previous auth token can't be removed. */
+class StaleStateFileError extends Error {}
+
 /** Fixed HMAC message: the fingerprint is keyed by the token, so it can't be
  * compared against a plain SHA-256 of the token computed anywhere else. */
 const FINGERPRINT_CONTEXT = "riffado-mcp:oauth-state:auth-token-fingerprint:v1"
@@ -281,7 +284,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
             `HTTP_AUTH_TOKEN (or predates token fingerprinting). All previously registered ` +
             `clients and issued tokens are revoked; connectors must log in again.`,
         )
-        this.persistState()
+        this.discardStaleStateFile()
         return
       }
 
@@ -310,14 +313,44 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
           `${this.accessTokens.size} access token(s), ${this.refreshTokens.size} refresh token(s)).`,
       )
     } catch (error) {
+      if (error instanceof StaleStateFileError) {
+        throw error
+      }
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Ignoring unreadable OAuth state file ${this.stateFile}: ${message}`)
     }
   }
 
   /**
+   * Replaces a state file issued under a different shared token with an
+   * empty one. Unlike every other persist, this one must not be
+   * best-effort: if the stale file survived, the next restart with the old
+   * token would match its fingerprint again and resurrect every revoked
+   * client and token. So fall back to deleting it, and if even that fails,
+   * refuse to start.
+   */
+  private discardStaleStateFile(): void {
+    if (this.persistState()) {
+      return
+    }
+    try {
+      fs.unlinkSync(this.stateFile!)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      throw new StaleStateFileError(
+        `Could not replace or delete stale OAuth state file ${this.stateFile} (${message}). ` +
+          `Refusing to start: it holds tokens issued under a previous HTTP_AUTH_TOKEN. ` +
+          `Delete it manually or make its directory writable.`,
+      )
+    }
+  }
+
+  /**
    * Persists clients and tokens to `stateFile`, if configured. Best-effort:
-   * a write failure is logged but never surfaced to the caller, since
+   * a write failure is logged and reported via the return value, never thrown, since
    * losing persistence should not break the OAuth flow that just
    * succeeded in memory.
    *
@@ -330,9 +363,9 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * already there) and `renameSync`-ing it over the target, which is
    * atomic on the same filesystem.
    */
-  private persistState(): void {
+  private persistState(): boolean {
     if (!this.stateFile) {
-      return
+      return true
     }
 
     this.pruneExpiredTokens()
@@ -352,6 +385,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     try {
       fs.writeFileSync(tmpFile, JSON.stringify(state), { mode: 0o600 })
       fs.renameSync(tmpFile, this.stateFile)
+      return true
     } catch (error) {
       try {
         fs.unlinkSync(tmpFile)
@@ -360,6 +394,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       }
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Failed to persist OAuth state to ${this.stateFile}: ${message}`)
+      return false
     }
   }
 

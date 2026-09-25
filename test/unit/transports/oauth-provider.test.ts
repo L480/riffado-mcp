@@ -297,6 +297,36 @@ describe("StaticTokenOAuthProvider token rotation revokes persisted state", () =
     expect(provider.clientsStore.getClient("legacy-client")).toBeUndefined()
     expect(provider.getValidAccessToken("legacy-at")).toBeUndefined()
   })
+
+  it("deletes a stale state file when it can't be rewritten", () => {
+    const provider1 = newProvider({ stateFile })
+    void provider1.clientsStore.registerClient!(clientMetadata("old"))
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+    newProvider({ authToken: "rotated-secret", stateFile })
+    write.mockRestore()
+    expect(fs.existsSync(stateFile)).toBe(false)
+  })
+
+  it("refuses to start when a stale state file can be neither rewritten nor deleted", () => {
+    const provider1 = newProvider({ stateFile })
+    void provider1.clientsStore.registerClient!(clientMetadata("old"))
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+    const unlink = vi.spyOn(fs, "unlinkSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+    expect(() => newProvider({ authToken: "rotated-secret", stateFile })).toThrow(
+      /Refusing to start/,
+    )
+    write.mockRestore()
+    unlink.mockRestore()
+    expect(fs.existsSync(stateFile)).toBe(true)
+  })
 })
 
 describe("StaticTokenOAuthProvider refresh token TTL", () => {
