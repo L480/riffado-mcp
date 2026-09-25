@@ -98,14 +98,14 @@ const redirectHostsFromEnv = z
   .default(DEFAULT_ALLOWED_REDIRECT_HOSTS.join(","))
   .transform((val, ctx) => {
     const hosts: string[] = []
-    for (const entry of val.split(",")) {
+    for (const [index, entry] of val.split(",").entries()) {
       if (entry.trim() === "") continue
       try {
         hosts.push(normalizeRedirectHost(entry))
       } catch (error) {
         ctx.addIssue({
           code: "custom",
-          message: `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS: ${(error as Error).message}`,
+          message: `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS entry #${index + 1}: ${(error as Error).message}`,
         })
         return z.NEVER
       }

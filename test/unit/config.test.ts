@@ -212,5 +212,19 @@ describe("loadConfig", () => {
         )
       },
     )
+
+    it("points at a bad entry by position without echoing it into the error", () => {
+      let message = ""
+      try {
+        loadConfig({
+          ...BASE_ENV,
+          HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS: "claude.ai,*.secret-host.example",
+        })
+      } catch (error) {
+        message = (error as Error).message
+      }
+      expect(message).toContain("entry #2")
+      expect(message).not.toContain("secret-host")
+    })
   })
 })

@@ -50,7 +50,9 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"])
  * (lowercase, punycode, bracketed IPv6), so matching is a plain set lookup
  * against the parsed redirect URI. Throws on anything that isn't a bare
  * hostname: wildcards (`*`, `*.example.com`) are deliberately unsupported,
- * as are ports, paths and userinfo.
+ * as are ports, paths and userinfo. Error messages deliberately don't echo
+ * the entry: they end up in startup logs, and callers point at the entry
+ * by position instead.
  */
 export function normalizeRedirectHost(entry: string): string {
   let host = entry.trim().toLowerCase()
@@ -58,7 +60,7 @@ export function normalizeRedirectHost(entry: string): string {
     throw new Error("empty host entry")
   }
   if (host.includes("*")) {
-    throw new Error(`wildcards are not supported ("${entry}")`)
+    throw new Error("wildcards are not supported")
   }
   // A bare IPv6 literal ("::1") is accepted and bracketed like URL does.
   if (host.includes(":") && !host.startsWith("[")) {
@@ -68,7 +70,7 @@ export function normalizeRedirectHost(entry: string): string {
   try {
     parsed = new URL(`http://${host}/`)
   } catch {
-    throw new Error(`not a valid hostname ("${entry}")`)
+    throw new Error("not a valid hostname")
   }
   if (
     parsed.hostname === "" ||
@@ -82,7 +84,7 @@ export function normalizeRedirectHost(entry: string): string {
     // would otherwise silently rewrite e.g. "127.1" to "127.0.0.1".
     host !== parsed.hostname
   ) {
-    throw new Error(`expected a bare hostname without port, path or userinfo ("${entry}")`)
+    throw new Error("expected a bare hostname without port, path or userinfo")
   }
   return parsed.hostname
 }
