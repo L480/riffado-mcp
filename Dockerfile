@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:22-alpine AS deps
+FROM node:24-alpine AS deps
 WORKDIR /app
 COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
@@ -10,7 +10,7 @@ WORKDIR /app
 COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS runtime
+FROM node:24-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ARG APP_UID=7333
@@ -19,7 +19,7 @@ COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --ignore-scripts
 
 # The entrypoint is `node dist/index.js` — npm/npx/yarn are never invoked at
-# runtime, but node:22-alpine bundles them anyway, and their own dependency
+# runtime, but node:24-alpine bundles them anyway, and their own dependency
 # trees (not this app's — `npm audit --omit=dev` is clean) are what a Trivy
 # scan of the published image actually flags. Must run after `npm ci` above,
 # which still needs npm; removing it earlier breaks the build.
