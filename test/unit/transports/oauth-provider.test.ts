@@ -371,6 +371,17 @@ describe("StaticTokenOAuthProvider refresh token TTL", () => {
     ).rejects.toThrow(/expired/)
   })
 
+  it("rejects a refresh token at the exact second it expires", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    vi.setSystemTime(Math.floor(Date.now() / 1000) * 1000)
+    const provider = newProvider({ refreshTokenTtlSeconds: 60 })
+    const { client, tokens } = await issueTokens(provider)
+    vi.setSystemTime(Date.now() + 60_000)
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /expired/,
+    )
+  })
+
   it("honours a custom refreshTokenTtlSeconds", async () => {
     vi.useFakeTimers({ toFake: ["Date"] })
     const provider = newProvider({ refreshTokenTtlSeconds: 60 })

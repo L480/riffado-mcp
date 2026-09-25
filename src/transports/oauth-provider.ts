@@ -306,7 +306,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
         this.clients.set(clientId, client)
       }
       for (const [token, authInfo] of parsed.accessTokens ?? []) {
-        if (authInfo.expiresAt !== undefined && authInfo.expiresAt < now) {
+        if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= now) {
           continue
         }
         this.accessTokens.set(token, {
@@ -317,7 +317,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       for (const [token, refreshToken] of parsed.refreshTokens ?? []) {
         // A missing expiresAt can only come from a hand-edited or foreign
         // file; treat it as expired rather than as "never expires".
-        if (typeof refreshToken.expiresAt !== "number" || refreshToken.expiresAt < now) {
+        if (typeof refreshToken.expiresAt !== "number" || refreshToken.expiresAt <= now) {
           continue
         }
         this.refreshTokens.set(token, refreshToken)
@@ -427,12 +427,12 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   private pruneExpiredTokens(): void {
     const now = Math.floor(Date.now() / 1000)
     for (const [token, authInfo] of this.accessTokens) {
-      if (authInfo.expiresAt !== undefined && authInfo.expiresAt < now) {
+      if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= now) {
         this.accessTokens.delete(token)
       }
     }
     for (const [token, refreshToken] of this.refreshTokens) {
-      if (refreshToken.expiresAt < now) {
+      if (refreshToken.expiresAt <= now) {
         this.refreshTokens.delete(token)
       }
     }
@@ -618,7 +618,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     }
     this.authorizationCodes.delete(authorizationCode)
 
-    if (stored.expiresAt < Date.now()) {
+    if (stored.expiresAt <= Date.now()) {
       throw new InvalidGrantError("Authorization code has expired")
     }
     if (redirectUri !== undefined && redirectUri !== stored.redirectUri) {
@@ -640,7 +640,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     }
     this.refreshTokens.delete(refreshToken)
 
-    if (stored.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (stored.expiresAt <= Math.floor(Date.now() / 1000)) {
       this.persistState()
       throw new InvalidGrantError("Refresh token has expired")
     }
@@ -699,7 +699,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     if (!authInfo) {
       return undefined
     }
-    if (authInfo.expiresAt !== undefined && authInfo.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= Math.floor(Date.now() / 1000)) {
       this.accessTokens.delete(token)
       return undefined
     }
