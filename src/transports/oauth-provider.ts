@@ -111,8 +111,22 @@ export function redirectUriRejection(
     return "must use https (http is only allowed for loopback hosts)"
   }
   // WHATWG URL drops an *empty* userinfo ("https://@claude.ai/"), leaving
-  // username/password blank, so also look for "@" in the raw authority.
-  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(redirectUri)?.[1] ?? ""
+  // username/password blank, so "@" is also checked in the raw authority.
+  // That only works if the raw string parses the way it reads: URL trims
+  // surrounding whitespace, strips tabs/newlines anywhere, treats "\\" as
+  // "/" and skips extra slashes. So reject all of those outright, and
+  // require exactly "scheme://" followed by the authority.
+  const hasControlChar = [...redirectUri].some((ch) => {
+    const code = ch.charCodeAt(0)
+    return code < 0x20 || code === 0x7f
+  })
+  if (hasControlChar || /[\s\\]/.test(redirectUri)) {
+    return "must not contain whitespace, control characters or backslashes"
+  }
+  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(redirectUri)?.[1]
+  if (authority === undefined) {
+    return "must be an absolute URL of the form scheme://host/..."
+  }
   if (parsed.username !== "" || parsed.password !== "" || authority.includes("@")) {
     return "must not contain userinfo"
   }
