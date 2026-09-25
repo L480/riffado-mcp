@@ -148,9 +148,45 @@ itself); if it is missing or doesn't match the current `HTTP_AUTH_TOKEN`,
 everything in the file is discarded on load. Every OAuth grant descends from
 someone knowing the shared token, so rotating that token has to revoke them
 all — otherwise a leaked refresh token would outlive the secret it was
-obtained with. Access tokens expire after 30 days, refresh tokens after 90
-(each refresh rotates the refresh token and restarts that clock); expired
-ones are dropped on load, on refresh, and on every state write.
+obtained with. Tokens are indexed, in memory and on disk, by their SHA-256
+hash only, so the state file is a straight dump of the maps and a copy of
+it can't be replayed; the file carries `version: 2`, and anything older
+(tokens keyed by raw value) is discarded like a fingerprint mismatch, at
+the cost of one re-login after the upgrade. Access tokens expire after 1
+hour, refresh tokens after 90 days. Each refresh rotates the refresh
+token, restarts that clock, and revokes the access token issued alongside
+the old one (the refresh token records its pair), so a grant has at most
+one live access token; a refresh may narrow scopes but not widen them.
+Expired tokens are dropped on load and whenever state changes (with or
+without a state file); expired authorization codes whenever a new one is
+issued. Persisting a fresh grant is best-effort (a failed write only loses
+that grant on restart), but anything that removes access is not: a refresh
+whose rotated state can't be written is rolled back and fails, and a
+revocation that can't be written is reported as an error and blocks new
+grants until a retry (or any later write) gets it to disk. That holds as
+long as the process keeps running: a restart while the file is still
+unwritable reloads the stale file, and nothing durable can record the
+revocation when the disk is the thing that failed. The operator-facing
+remedy (fix the volume, retry, or rotate `HTTP_AUTH_TOKEN`) is in
+SECURITY.md.
+
+Dynamic client registration is open by spec, which makes two things
+attacker-controlled: the redirect URI and the registry size. Redirect URIs
+must be on `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS` (checked at registration and
+again when persisted clients are loaded), because the SDK's `/authorize`
+302s to whatever the client registered — otherwise the server is an open
+redirect and a phishing page that looks like our own login. The registry
+cap evicts only clients without a live grant: a client with one got there
+through the shared token, while a fresh anonymous registration did not, so
+a flood can only cycle through other anonymous registrations; when every
+slot holds a grant, registration fails instead of evicting.
+
+Rate limiting follows the same line. Failed authentications are counted per
+IP (the limiter runs only on the 401 path, so long-lived SSE streams and
+normal traffic never consume that budget) and a spent budget 429s the IP
+up front. Authenticated traffic only gets a generous ceiling against a
+leaked token or a runaway client hammering the database; `/health` is
+never limited.
 
 ## Don't put an identity-aware proxy in front
 

@@ -2,6 +2,10 @@ import { z } from "zod"
 import os from "os"
 import path from "path"
 import dotenv from "dotenv"
+import {
+  DEFAULT_ALLOWED_REDIRECT_HOSTS,
+  normalizeRedirectHost,
+} from "./transports/oauth-provider.js"
 
 // `quiet: true` matters here, not just for tidy logs: dotenv >=16.4 writes a
 // banner to stdout by default, and stdout is the JSON-RPC channel on the
@@ -83,6 +87,39 @@ const trustProxyCoercion = z
     return val
   })
 
+/**
+ * Comma-separated hostnames OAuth clients may register redirect URIs for.
+ * Each entry must be a bare hostname (no scheme, port, path or wildcard);
+ * see `normalizeRedirectHost`. An empty list would make OAuth login
+ * impossible, so it's rejected rather than silently accepted.
+ */
+const redirectHostsFromEnv = z
+  .string()
+  .default(DEFAULT_ALLOWED_REDIRECT_HOSTS.join(","))
+  .transform((val, ctx) => {
+    const hosts: string[] = []
+    for (const [index, entry] of val.split(",").entries()) {
+      if (entry.trim() === "") continue
+      try {
+        hosts.push(normalizeRedirectHost(entry))
+      } catch (error) {
+        ctx.addIssue({
+          code: "custom",
+          message: `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS entry #${index + 1}: ${(error as Error).message}`,
+        })
+        return z.NEVER
+      }
+    }
+    if (hosts.length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS must list at least one hostname",
+      })
+      return z.NEVER
+    }
+    return [...new Set(hosts)]
+  })
+
 const configSchema = z
   .object({
     DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
@@ -111,6 +148,7 @@ const configSchema = z
       .refine(isValidUrl, "HTTP_PUBLIC_URL must be a valid URL")
       .optional(),
     HTTP_OAUTH_STATE_FILE: z.string().default(defaultOAuthStateFile),
+    HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS: redirectHostsFromEnv,
     HTTP_TRUST_PROXY: trustProxyCoercion,
     // Default 1h idle expiry. `0` remains a valid explicit opt-out that
     // disables idle expiry entirely (sessions only end on protocol

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { IV_STAMP_PREFIX_LEN, JSON_IV_STAMP_PREFIX_LEN } from "../../../src/riffado/crypto.js"
-import { RecordingStore } from "../../../src/riffado/store.js"
+import { RecordingStore, safeErrorLabel } from "../../../src/riffado/store.js"
 import { encryptForTest, TEST_ENCRYPTION_KEY } from "../../integration/seed.js"
 
 const KEY = Buffer.from(TEST_ENCRYPTION_KEY, "hex")
@@ -433,5 +433,143 @@ describe("RecordingStore.getTranscripts()", () => {
     store.invalidate()
     await store.getTranscripts(["a"])
     expect(calls).toHaveLength(2)
+  })
+})
+
+describe("RecordingStore per-recording error isolation", () => {
+  it("a recording with an undecryptable field (bad GCM tag) is skipped, not fatal to the refresh", async () => {
+    const badFilename = corruptedSameIv(encryptForTest("Broken title"))
+    const bad = fixture({ id: "rec-bad", filename: badFilename })
+    const good = fixture({ id: "rec-good" })
+    const { pool } = fakePool({
+      stamp: [[bad.stamp, good.stamp]],
+      metadata: [[bad.meta, good.meta]],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    const recordings = await store.get()
+
+    expect(recordings.map((r) => r.id)).toEqual(["rec-good"])
+    const skipLine = errorSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((line) => line.includes("skipping recording rec-bad"))
+    expect(skipLine).toBeDefined()
+    expect(skipLine).not.toContain("Broken title")
+    expect(skipLine).not.toContain(badFilename)
+
+    errorSpy.mockRestore()
+  })
+
+  it("a cached recording that turns undecryptable is dropped, not served from the stale snapshot", async () => {
+    const f1 = fixture({ summary: encryptForTest("Old summary") })
+    const newSummary = encryptForTest("New summary")
+    const f2 = fixture({ summary: newSummary })
+    const { pool } = fakePool({
+      stamp: [[f1.stamp], [f2.stamp]], // IV changed -> rec-1 is re-fetched
+      metadata: [[f1.meta], [{ ...f2.meta, summary: corruptedSameIv(newSummary) }]],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    expect((await store.get()).map((r) => r.summary)).toEqual(["Old summary"])
+    expect(await store.get()).toEqual([])
+
+    errorSpy.mockRestore()
+  })
+
+  it("a changed recording that vanishes between phase 1 and phase 2 is dropped, not served stale", async () => {
+    const f1 = fixture({ summary: encryptForTest("Old summary") })
+    const f2 = fixture({ summary: encryptForTest("New summary") })
+    const { pool } = fakePool({ stamp: [[f1.stamp], [f2.stamp]], metadata: [[f1.meta], []] })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    vi.spyOn(console, "error").mockImplementation(() => {})
+
+    await store.get()
+    expect(await store.get()).toEqual([])
+    vi.restoreAllMocks()
+  })
+
+  it("a recording that vanished mid-refresh is fetched again on the next refresh", async () => {
+    const f = fixture({ summary: encryptForTest("A summary") })
+    const { pool, calls } = fakePool({
+      stamp: [[f.stamp], [f.stamp]], // same stamp both times
+      metadata: [[], [f.meta]], // missing in phase 2 the first time only
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    vi.spyOn(console, "error").mockImplementation(() => {})
+
+    expect(await store.get()).toEqual([])
+    expect((await store.get()).map((r) => r.summary)).toEqual(["A summary"])
+    expect(calls.filter((c) => c.kind === "metadata")).toHaveLength(2)
+    vi.restoreAllMocks()
+  })
+
+  it("a recording with invalid JSON in key_points is skipped, not fatal to the refresh", async () => {
+    const bad = fixture({
+      id: "rec-bad-json",
+      keyPoints: pgJsonbWrapper(encryptForTest("not valid json")),
+    })
+    const good = fixture({ id: "rec-good" })
+    const { pool } = fakePool({
+      stamp: [[bad.stamp, good.stamp]],
+      metadata: [[bad.meta, good.meta]],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    const recordings = await store.get()
+
+    expect(recordings.map((r) => r.id)).toEqual(["rec-good"])
+    const skipLine = errorSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((line) => line.includes("skipping recording rec-bad-json"))
+    expect(skipLine).toBeDefined()
+    // JSON.parse quotes its input in the error message; that input is
+    // decrypted content and must not reach the log.
+    expect(skipLine).toContain("invalid JSON")
+    expect(skipLine).not.toContain("not valid json")
+
+    errorSpy.mockRestore()
+  })
+})
+
+describe("safeErrorLabel", () => {
+  it("passes through only content-free messages", () => {
+    expect(safeErrorLabel(new SyntaxError('Unexpected token, "secret" is not valid JSON'))).toBe(
+      "invalid JSON (SyntaxError)",
+    )
+    expect(safeErrorLabel(new Error("invalid v1 ciphertext: IV must be 24 hex chars, got 2"))).toBe(
+      "invalid v1 ciphertext: IV must be 24 hex chars, got 2",
+    )
+    expect(safeErrorLabel(new Error("Unsupported state or unable to authenticate data"))).toBe(
+      "Unsupported state or unable to authenticate data",
+    )
+    expect(safeErrorLabel(new TypeError("something with secret content"))).toBe("TypeError")
+    expect(safeErrorLabel("secret")).toBe("unknown error")
+  })
+})
+
+describe("RecordingStore.getTranscripts() error isolation", () => {
+  it("one undecryptable transcript row yields no text for that source, without throwing for the batch", async () => {
+    const badText = corruptedSameIv(encryptForTest("secret transcript"))
+    const { pool } = fakePool({
+      transcripts: [
+        { recording_id: "a", source: "riffado", text: badText },
+        { recording_id: "b", source: "riffado", text: encryptForTest("text b") },
+      ],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 60000 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    const byId = await store.getTranscripts(["a", "b"])
+
+    expect(byId.get("a")).toEqual([])
+    expect(byId.get("b")![0].text).toBe("text b")
+    expect(
+      errorSpy.mock.calls.some((c) => String(c[0]).includes("skipping transcript for recording a")),
+    ).toBe(true)
+
+    errorSpy.mockRestore()
   })
 })

@@ -77,23 +77,24 @@ transcripts):
 
 ## Environment variables
 
-| Var                       | Default                           | Notes                                                                                                                                                                                                                                 |
-| ------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`            | _required_                        | `postgresql://postgres:…@riffado-db:5432/riffado`                                                                                                                                                                                     |
-| `ENCRYPTION_KEY`          | _required_                        | 64 hex chars (32-byte AES key)                                                                                                                                                                                                        |
-| `RIFFADO_USER_ID`         | —                                 | restrict to one user                                                                                                                                                                                                                  |
-| `RIFFADO_APP_URL`         | —                                 | e.g. `https://riffado.example.com` → deep links in tool output                                                                                                                                                                        |
-| `TRANSPORT`               | `stdio`                           | `stdio` \| `http`                                                                                                                                                                                                                     |
-| `HTTP_PORT` / `HTTP_HOST` | `3000` / `localhost`              | port 1-65535; container sets host `0.0.0.0`                                                                                                                                                                                           |
-| `HTTP_AUTH_TOKEN`         | _required for `http`_             | shared secret, min 32 chars; the HTTP transport refuses to start without it (unused on `stdio`)                                                                                                                                       |
-| `HTTP_AUTH_HEADER_NAME`   | `x-mcp-token`                     |                                                                                                                                                                                                                                       |
-| `HTTP_OAUTH_ENABLED`      | `true`                            | wraps `HTTP_AUTH_TOKEN` in an OAuth 2.1 login flow for Claude connectors                                                                                                                                                              |
-| `HTTP_PUBLIC_URL`         | —                                 | OAuth issuer; must be HTTPS unless `localhost`                                                                                                                                                                                        |
-| `HTTP_OAUTH_STATE_FILE`   | `~/.riffado-mcp-oauth-state.json` | container: `/app/data/oauth-state.json`                                                                                                                                                                                               |
-| `HTTP_TRUST_PROXY`        | `false`                           | Express `trust proxy` (`true`/`false`, a hop count 0-10, or a subnet/preset); **set it (e.g. `1`) behind a reverse proxy / Cloudflare Tunnel**, leave it off when clients connect directly (otherwise `X-Forwarded-For` is spoofable) |
-| `HTTP_SESSION_TIMEOUT_MS` | `3600000` (1h)                    | idle-session expiry; `0` = no idle expiry (explicit opt-out, sessions close only on DELETE/transport close); max 2147483647                                                                                                           |
-| `CACHE_TTL_MS`            | `60000`                           | decrypted-store TTL; positive integer                                                                                                                                                                                                 |
-| `DB_STATEMENT_TIMEOUT_MS` | `10000`                           | passed to the pg pool; positive integer (`0` would mean no limit, so it is rejected)                                                                                                                                                  |
+| Var                                 | Default                                          | Notes                                                                                                                                                                                                                                                                |
+| ----------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                      | _required_                                       | `postgresql://postgres:…@riffado-db:5432/riffado`                                                                                                                                                                                                                    |
+| `ENCRYPTION_KEY`                    | _required_                                       | 64 hex chars (32-byte AES key)                                                                                                                                                                                                                                       |
+| `RIFFADO_USER_ID`                   | —                                                | restrict to one user                                                                                                                                                                                                                                                 |
+| `RIFFADO_APP_URL`                   | —                                                | e.g. `https://riffado.example.com` → deep links in tool output                                                                                                                                                                                                       |
+| `TRANSPORT`                         | `stdio`                                          | `stdio` \| `http`                                                                                                                                                                                                                                                    |
+| `HTTP_PORT` / `HTTP_HOST`           | `3000` / `localhost`                             | port 1-65535; container sets host `0.0.0.0`                                                                                                                                                                                                                          |
+| `HTTP_AUTH_TOKEN`                   | _required for `http`_                            | shared secret, min 32 chars; the HTTP transport refuses to start without it (unused on `stdio`)                                                                                                                                                                      |
+| `HTTP_AUTH_HEADER_NAME`             | `x-mcp-token`                                    |                                                                                                                                                                                                                                                                      |
+| `HTTP_OAUTH_ENABLED`                | `true`                                           | wraps `HTTP_AUTH_TOKEN` in an OAuth 2.1 login flow for Claude connectors                                                                                                                                                                                             |
+| `HTTP_PUBLIC_URL`                   | —                                                | OAuth issuer; must be HTTPS unless `localhost`                                                                                                                                                                                                                       |
+| `HTTP_OAUTH_STATE_FILE`             | `~/.riffado-mcp-oauth-state.json`                | container: `/app/data/oauth-state.json`                                                                                                                                                                                                                              |
+| `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS` | `claude.ai,claude.com,localhost,127.0.0.1,[::1]` | comma-separated hostnames OAuth clients may register redirect URIs for (exact match, no port; `https` required except loopback, which may use `http`). Wildcards like `*` are **not** supported. Clients persisted with a host no longer listed are dropped on start |
+| `HTTP_TRUST_PROXY`                  | `false`                                          | Express `trust proxy` (`true`/`false`, a hop count 0-10, or a subnet/preset); **set it (e.g. `1`) behind a reverse proxy / Cloudflare Tunnel**, leave it off when clients connect directly (otherwise `X-Forwarded-For` is spoofable)                                |
+| `HTTP_SESSION_TIMEOUT_MS`           | `3600000` (1h)                                   | idle-session expiry; `0` = no idle expiry (explicit opt-out, sessions close only on DELETE/transport close); max 2147483647                                                                                                                                          |
+| `CACHE_TTL_MS`                      | `60000`                                          | decrypted-store TTL; positive integer                                                                                                                                                                                                                                |
+| `DB_STATEMENT_TIMEOUT_MS`           | `10000`                                          | passed to the pg pool; positive integer (`0` would mean no limit, so it is rejected)                                                                                                                                                                                 |
 
 Numeric variables must be plain integers within their range — a value like
 `3000abc` or `1.5` fails at startup instead of being silently truncated.
@@ -104,6 +105,12 @@ Numeric variables must be plain integers within their range — a value like
 `{ status, timestamp }`. `GET /health/details` adds session count, DB
 reachability and the cached recording count, and requires the same
 auth as every other route (shared token or OAuth).
+
+`/health` is also exempt from rate limiting. Everything else is limited per
+client IP in 15-minute windows: 50 failed authentications (401s) lock that
+IP out with `429` for the rest of the window, even with a valid token;
+authenticated traffic is capped at 1000 requests; `/register`,
+`/authorize` and `/token` together at 30.
 
 ## Quickstart: Claude Code (stdio)
 
@@ -141,8 +148,19 @@ npm run build
    restarts because OAuth state is persisted to `HTTP_OAUTH_STATE_FILE`.
    Rotating `HTTP_AUTH_TOKEN` revokes every issued OAuth token and
    registered client on the next start; connectors then log in again with
-   the new value. A connector left idle for more than 90 days (refresh
-   token lifetime) also has to log in again.
+   the new value. Access tokens live 1 hour and are refreshed silently;
+   a connector left idle for more than 90 days (refresh token lifetime)
+   has to log in again.
+
+### Upgrade note: one-time re-login
+
+The OAuth state file format changed (tokens are now stored only as
+SHA-256 hashes, `version: 2`). On the first start after upgrading, the old
+file is discarded and rewritten empty, so every connector has to log in
+once more with `HTTP_AUTH_TOKEN`. Clients registered with a redirect host
+outside `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS` are rejected from now on; if
+you use an OAuth client other than Claude or a loopback tool, add its
+callback host there.
 
 ## Docker Compose example
 

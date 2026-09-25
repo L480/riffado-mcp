@@ -98,6 +98,91 @@ describe("StreamableHttpServer", () => {
     expect(res.statusCode).toBe(401)
   })
 
+  it("does not advertise Express via X-Powered-By", async () => {
+    ;({ server } = await startServer())
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+    const res = await request(port, "/health")
+    expect(res.headers["x-powered-by"]).toBeUndefined()
+  })
+
+  it("rejects start() when the port is already in use instead of hanging", async () => {
+    let port: number
+    ;({ server, port } = await startServer())
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const second = new StreamableHttpServer({
+      port,
+      host: "127.0.0.1",
+      authToken: TOKEN,
+      enableRequestLogging: false,
+      createServer: stubServer,
+    })
+    await expect(second.start()).rejects.toMatchObject({ code: "EADDRINUSE" })
+    vi.restoreAllMocks()
+  })
+
+  describe("rate limiting", () => {
+    const post = (port: number, headers: Record<string, string> = {}) =>
+      request(port, "/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: "{}",
+      })
+
+    it("locks an IP out with 429 after 50 failed authentications, valid token or not", async () => {
+      let port: number
+      ;({ server, port } = await startServer())
+      for (let i = 0; i < 50; i++) {
+        expect((await post(port)).statusCode).toBe(401)
+      }
+      const lockedOut = await post(port, AUTH)
+      expect(lockedOut.statusCode).toBe(429)
+      expect(Number(lockedOut.headers["retry-after"])).toBeGreaterThan(0)
+      expect((await post(port)).statusCode).toBe(429)
+      // Liveness probes are never locked out.
+      expect((await request(port, "/health")).statusCode).toBe(200)
+    })
+
+    it("keys the lockout per client IP", async () => {
+      let port: number
+      ;({ server, port } = await startServer({ trustProxy: 1 }))
+      const attacker = { "X-Forwarded-For": "203.0.113.7" }
+      for (let i = 0; i < 50; i++) await post(port, attacker)
+      expect((await post(port, attacker)).statusCode).toBe(429)
+      const other = await post(port, { "X-Forwarded-For": "198.51.100.1", ...AUTH })
+      expect(other.statusCode).not.toBe(429)
+      expect(other.statusCode).not.toBe(401)
+    })
+
+    it("does not count authenticated requests against the failed-auth budget", async () => {
+      let port: number
+      ;({ server, port } = await startServer())
+      // More than the old global limit of 300, and interleaved with 49
+      // failures: the IP must still not be locked out.
+      const authed = await Promise.all(Array.from({ length: 310 }, () => post(port, AUTH)))
+      expect(authed.some((r) => r.statusCode === 429)).toBe(false)
+      for (let i = 0; i < 49; i++) await post(port)
+      expect((await post(port, AUTH)).statusCode).not.toBe(429)
+    })
+
+    it("caps authenticated traffic at a generous 1000 requests per window", async () => {
+      let port: number
+      ;({ server, port } = await startServer())
+      const results = await Promise.all(Array.from({ length: 1000 }, () => post(port, AUTH)))
+      expect(results.some((r) => r.statusCode === 429)).toBe(false)
+      expect((await post(port, AUTH)).statusCode).toBe(429)
+    })
+
+    it("does not rate-limit /health", async () => {
+      let port: number
+      ;({ server, port } = await startServer())
+      const results = await Promise.all(
+        Array.from({ length: 1100 }, () => request(port, "/health")),
+      )
+      expect(results.every((r) => r.statusCode === 200)).toBe(true)
+    })
+  })
+
   it("provides a health check that is public", async () => {
     ;({ server } = await startServer())
     // @ts-expect-error private property access for test

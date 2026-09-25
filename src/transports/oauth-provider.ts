@@ -5,7 +5,7 @@
  * authenticate against a shared secret. Same shape, renamed for Riffado.
  */
 import { Response } from "express"
-import { createHmac, randomUUID, randomBytes, timingSafeEqual } from "crypto"
+import { createHash, createHmac, randomUUID, randomBytes, timingSafeEqual } from "crypto"
 import fs from "fs"
 import path from "path"
 import type {
@@ -19,10 +19,131 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js"
 import {
+  CustomOAuthError,
   InvalidGrantError,
+  InvalidScopeError,
   InvalidTokenError,
   ServerError,
+  TooManyRequestsError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js"
+
+/**
+ * Hosts OAuth clients may register redirect URIs for when
+ * `HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS` is unset: Claude's connector callback
+ * (`https://claude.ai/api/mcp/auth_callback`, plus claude.com) and loopback
+ * for local tools such as the MCP Inspector.
+ */
+export const DEFAULT_ALLOWED_REDIRECT_HOSTS: readonly string[] = [
+  "claude.ai",
+  "claude.com",
+  "localhost",
+  "127.0.0.1",
+  "[::1]",
+]
+
+/** Loopback hosts, the only ones allowed to use plain `http:` redirect URIs
+ * (RFC 8252 §7.3). Same set the SDK relaxes the port check for. */
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"])
+
+/**
+ * Canonicalises one allowlist entry to the form `URL#hostname` produces
+ * (lowercase, punycode, bracketed IPv6), so matching is a plain set lookup
+ * against the parsed redirect URI. Throws on anything that isn't a bare
+ * hostname: wildcards (`*`, `*.example.com`) are deliberately unsupported,
+ * as are ports, paths and userinfo. Error messages deliberately don't echo
+ * the entry: they end up in startup logs, and callers point at the entry
+ * by position instead.
+ */
+export function normalizeRedirectHost(entry: string): string {
+  let host = entry.trim().toLowerCase()
+  if (host.length === 0) {
+    throw new Error("empty host entry")
+  }
+  if (host.includes("*")) {
+    throw new Error("wildcards are not supported")
+  }
+  // A bare IPv6 literal ("::1") is accepted and bracketed like URL does.
+  if (host.includes(":") && !host.startsWith("[")) {
+    host = `[${host}]`
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(`http://${host}/`)
+  } catch {
+    throw new Error("not a valid hostname")
+  }
+  if (
+    parsed.hostname === "" ||
+    parsed.port !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.pathname !== "/" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    // Only a host that round-trips unchanged is unambiguous: URL parsing
+    // would otherwise silently rewrite e.g. "127.1" to "127.0.0.1".
+    host !== parsed.hostname
+  ) {
+    throw new Error("expected a bare hostname without port, path or userinfo")
+  }
+  return parsed.hostname
+}
+
+/**
+ * Why `redirectUri` may not be registered under `allowedHosts` (already
+ * normalised), or `undefined` if it may. Requires `https:` — or `http:` for
+ * loopback hosts — an allowlisted hostname (compared exactly, so
+ * `https://claude.ai@evil.example/` is `evil.example`, and `claude.ai.` is
+ * not `claude.ai`), no userinfo and no fragment (RFC 6749 §3.1.2).
+ */
+export function redirectUriRejection(
+  redirectUri: string,
+  allowedHosts: ReadonlySet<string>,
+): string | undefined {
+  let parsed: URL
+  try {
+    parsed = new URL(redirectUri)
+  } catch {
+    return "is not a valid URL"
+  }
+  const loopback = LOOPBACK_HOSTS.has(parsed.hostname)
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    return "must use https (http is only allowed for loopback hosts)"
+  }
+  // WHATWG URL drops an *empty* userinfo ("https://@claude.ai/"), leaving
+  // username/password blank, so "@" is also checked in the raw authority.
+  // That only works if the raw string parses the way it reads: URL trims
+  // surrounding whitespace, strips tabs/newlines anywhere, treats "\\" as
+  // "/" and skips extra slashes. So reject all of those outright, and
+  // require exactly "scheme://" followed by the authority.
+  const hasControlChar = [...redirectUri].some((ch) => {
+    const code = ch.charCodeAt(0)
+    return code < 0x20 || code === 0x7f
+  })
+  if (hasControlChar || /[\s\\]/.test(redirectUri)) {
+    return "must not contain whitespace, control characters or backslashes"
+  }
+  const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(redirectUri)?.[1]
+  if (authority === undefined) {
+    return "must be an absolute URL of the form scheme://host/..."
+  }
+  if (parsed.username !== "" || parsed.password !== "" || authority.includes("@")) {
+    return "must not contain userinfo"
+  }
+  if (redirectUri.includes("#")) {
+    return "must not contain a fragment"
+  }
+  if (!allowedHosts.has(parsed.hostname)) {
+    return `host "${parsed.hostname}" is not in HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS`
+  }
+  return undefined
+}
+
+/** SHA-256 (hex) of an issued token: the only form tokens are indexed and
+ * persisted under, so the state file never holds a usable bearer token. */
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex")
+}
 
 /** Configuration for the static-token OAuth provider. */
 export interface StaticTokenOAuthOptions {
@@ -32,7 +153,7 @@ export interface StaticTokenOAuthOptions {
   authorizeEndpoint: string
   /** RFC 8707 resource identifier advertised for issued tokens. */
   resource?: string
-  /** Lifetime of issued access tokens in seconds (default: 30 days). */
+  /** Lifetime of issued access tokens in seconds (default: 1 hour). */
   accessTokenTtlSeconds?: number
   /**
    * Lifetime of issued refresh tokens in seconds (default: 90 days). Each
@@ -57,12 +178,24 @@ export interface StaticTokenOAuthOptions {
    * `/register` is unauthenticated per the MCP DCR spec, so without a cap
    * an anonymous caller could grow the in-memory map — and the on-disk
    * state file `persistState` rewrites on every registration — without
-   * bound. Once at capacity, the oldest client is evicted to make room.
+   * bound. Once at capacity, the oldest client holding no live grant is
+   * evicted to make room; if every client holds one, registration fails.
    */
   maxClients?: number
+  /**
+   * Hostnames registered redirect URIs may point at (default:
+   * `DEFAULT_ALLOWED_REDIRECT_HOSTS`). Entries are normalised with
+   * `normalizeRedirectHost`; wildcards are not supported.
+   */
+  allowedRedirectHosts?: readonly string[]
 }
 
+/** Current state-file format. Files with any other `version` (including
+ * none: the v1 format keyed tokens by their raw value) are discarded. */
+const STATE_VERSION = 2
+
 interface PersistedState {
+  version: typeof STATE_VERSION
   /**
    * HMAC of the shared token the state was issued under (never the token
    * itself). On load, a missing or different value means `HTTP_AUTH_TOKEN`
@@ -71,7 +204,9 @@ interface PersistedState {
    */
   authTokenFingerprint?: string
   clients: [string, OAuthClientInformationFull][]
-  accessTokens: [string, AuthInfo][]
+  /** Keyed by `hashToken(accessToken)`. */
+  accessTokens: [string, StoredAccessToken][]
+  /** Keyed by `hashToken(refreshToken)`. */
   refreshTokens: [string, StoredRefreshToken][]
 }
 
@@ -84,13 +219,30 @@ interface StoredAuthorizationCode {
   expiresAt: number
 }
 
-interface StoredRefreshToken {
+interface StoredAccessToken {
   clientId: string
   scopes: string[]
   resource?: string
   /** Expiry as epoch seconds, same unit as `AuthInfo.expiresAt`. */
   expiresAt: number
 }
+
+interface StoredRefreshToken {
+  clientId: string
+  scopes: string[]
+  resource?: string
+  /** Expiry as epoch seconds, same unit as `AuthInfo.expiresAt`. */
+  expiresAt: number
+  /** Hash of the access token issued together with this refresh token,
+   * revoked when this refresh token is used or revoked. */
+  accessTokenHash?: string
+}
+
+const isSha256Hex = (value: unknown): value is string =>
+  typeof value === "string" && /^[0-9a-f]{64}$/.test(value)
+
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((v) => typeof v === "string")
 
 /**
  * Thrown when the state file exists but can't be verified or cleared: it
@@ -181,10 +333,13 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   private readonly serverName: string
   private readonly stateFile?: string
   private readonly maxClients: number
+  private readonly allowedRedirectHosts: ReadonlySet<string>
 
   private readonly clients = new Map<string, OAuthClientInformationFull>()
   private readonly authorizationCodes = new Map<string, StoredAuthorizationCode>()
-  private readonly accessTokens = new Map<string, AuthInfo>()
+  /** Keyed by `hashToken(accessToken)`, never the token itself. */
+  private readonly accessTokens = new Map<string, StoredAccessToken>()
+  /** Keyed by `hashToken(refreshToken)`, never the token itself. */
   private readonly refreshTokens = new Map<string, StoredRefreshToken>()
 
   constructor(options: StaticTokenOAuthOptions) {
@@ -192,20 +347,27 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     this.authTokenFingerprint = fingerprintAuthToken(options.authToken)
     this.authorizeEndpoint = options.authorizeEndpoint
     this.resource = options.resource
-    this.accessTokenTtlSeconds = options.accessTokenTtlSeconds ?? 30 * 24 * 60 * 60
+    this.accessTokenTtlSeconds = options.accessTokenTtlSeconds ?? 60 * 60
     this.refreshTokenTtlSeconds = options.refreshTokenTtlSeconds ?? 90 * 24 * 60 * 60
     this.authorizationCodeTtlSeconds = options.authorizationCodeTtlSeconds ?? 5 * 60
     this.serverName = options.serverName ?? "Riffado MCP"
     this.stateFile = options.stateFile
     this.maxClients = options.maxClients ?? 100
+    this.allowedRedirectHosts = new Set(
+      (options.allowedRedirectHosts ?? DEFAULT_ALLOWED_REDIRECT_HOSTS).map(normalizeRedirectHost),
+    )
     this.loadState()
   }
 
   public readonly clientsStore: OAuthRegisteredClientsStore = {
     getClient: (clientId: string) => this.clients.get(clientId),
     registerClient: (client) => {
-      if (this.clients.size >= this.maxClients) {
-        this.evictOldestClient()
+      // Validated before anything is evicted, so a rejected registration
+      // can't cost an existing client its slot. The SDK's register handler
+      // turns an OAuthError into a 400 carrying its error code.
+      this.assertRedirectUrisAllowed(client.redirect_uris)
+      while (this.clients.size >= this.maxClients) {
+        this.evictOldestIdleClient()
       }
       const clientId = randomUUID()
       const full: OAuthClientInformationFull = {
@@ -219,38 +381,93 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     },
   }
 
+  /** Throws RFC 7591's `invalid_redirect_uri` unless every redirect URI is
+   * allowed (and there is at least one: only the code flow is supported). */
+  private assertRedirectUrisAllowed(redirectUris: unknown): void {
+    if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
+      throw new CustomOAuthError("invalid_redirect_uri", "At least one redirect_uri is required")
+    }
+    for (const uri of redirectUris) {
+      const reason =
+        typeof uri === "string"
+          ? redirectUriRejection(uri, this.allowedRedirectHosts)
+          : "is not a string"
+      if (reason) {
+        throw new CustomOAuthError("invalid_redirect_uri", `redirect_uri ${reason}`)
+      }
+    }
+  }
+
+  /** Whether every redirect URI of a (persisted) client is still allowed. */
+  private redirectUrisAllowed(client: OAuthClientInformationFull): boolean {
+    try {
+      this.assertRedirectUrisAllowed(client.redirect_uris)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   /**
-   * Evicts the single oldest registered client to make room under
-   * `maxClients`. Picked by `client_id_issued_at` rather than relying on
-   * `Map` insertion order — the two agree in practice (insertion order is
-   * issuance order here, including after a state-file reload, since that
-   * reload replays the persisted array in order), but issued_at is the
-   * actual source of truth and the lookup is O(maxClients), cheap at this
-   * cap size.
+   * Makes room under `maxClients` by evicting the oldest client (by
+   * `client_id_issued_at`) that holds no live grant — no unexpired access
+   * token, refresh token or authorization code. `/register` is
+   * unauthenticated, so evicting regardless of grants would let anyone
+   * flood registrations until the real connector's client is evicted and
+   * its next refresh fails. A client with a live grant was, by
+   * construction, authorized with the shared token, so those are never
+   * evicted: once every slot holds one, registration is refused instead
+   * (the cap is far above what a single-user server needs).
    *
-   * Deliberately does NOT touch `accessTokens`/`refreshTokens` belonging to
-   * the evicted client: `verifyAccessToken`/`getValidAccessToken` never
-   * check that a token's client still exists, only that the token itself
-   * is known and unexpired, and `revokeToken` already deletes tokens
-   * independently of the client registry. So an evicted client's
-   * previously issued tokens simply keep working until their own TTL
-   * expires — consistent with how tokens already behave everywhere else in
-   * this provider, and correct because eviction here is a registry-size
-   * safeguard against unbounded `/register` growth, not a revocation
-   * mechanism.
+   * Anything the evicted client still owns (only expired grants, by the
+   * above) is dropped with it, so no token outlives its client.
    */
-  private evictOldestClient(): void {
+  private evictOldestIdleClient(): void {
+    const withLiveGrant = this.clientIdsWithLiveGrants()
     let oldestId: string | undefined
     let oldestIssuedAt = Infinity
     for (const [id, client] of this.clients) {
+      if (withLiveGrant.has(id)) {
+        continue
+      }
       const issuedAt = client.client_id_issued_at ?? 0
       if (issuedAt < oldestIssuedAt) {
         oldestIssuedAt = issuedAt
         oldestId = id
       }
     }
-    if (oldestId !== undefined) {
-      this.clients.delete(oldestId)
+    if (oldestId === undefined) {
+      throw new TooManyRequestsError(
+        "Client registration limit reached and every registered client holds an active grant",
+      )
+    }
+    this.removeClient(oldestId)
+  }
+
+  /** Client IDs that currently hold an unexpired token or authorization code. */
+  private clientIdsWithLiveGrants(): Set<string> {
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const live = new Set<string>()
+    for (const token of this.accessTokens.values()) {
+      if (token.expiresAt > nowSeconds) live.add(token.clientId)
+    }
+    for (const token of this.refreshTokens.values()) {
+      if (token.expiresAt > nowSeconds) live.add(token.clientId)
+    }
+    const nowMs = Date.now()
+    for (const code of this.authorizationCodes.values()) {
+      if (code.expiresAt > nowMs) live.add(code.clientId)
+    }
+    return live
+  }
+
+  /** Removes a client together with every token and code it owns. */
+  private removeClient(clientId: string): void {
+    this.clients.delete(clientId)
+    for (const map of [this.accessTokens, this.refreshTokens, this.authorizationCodes]) {
+      for (const [key, grant] of map) {
+        if (grant.clientId === clientId) map.delete(key)
+      }
     }
   }
 
@@ -261,10 +478,12 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * as "no prior state" rather than a fatal error.
    *
    * State issued under a different shared token (fingerprint mismatch, or
-   * no fingerprint at all) is discarded wholesale and the file rewritten
-   * empty, so rotating `HTTP_AUTH_TOKEN` revokes every client and token
-   * obtained with the old one. Expired access and refresh tokens are
-   * dropped too.
+   * no fingerprint at all) or in an older format (no `version: 2`: tokens
+   * keyed by their raw value) is discarded wholesale and the file
+   * rewritten empty, so rotating `HTTP_AUTH_TOKEN` revokes every client and
+   * token obtained with the old one. Expired tokens, clients whose redirect
+   * URIs are no longer allowed, and tokens of dropped clients are dropped
+   * too.
    */
   private loadState(): void {
     if (!this.stateFile) {
@@ -292,6 +511,16 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       const parsed = JSON.parse(raw) as Partial<PersistedState>
       const now = Math.floor(Date.now() / 1000)
 
+      if (parsed.version !== STATE_VERSION) {
+        console.error(
+          `Discarding OAuth state from ${this.stateFile}: it uses an older format ` +
+            `(tokens stored unhashed). All previously registered clients and issued ` +
+            `tokens are revoked; connectors must log in again once.`,
+        )
+        this.discardStaleStateFile()
+        return
+      }
+
       if (!this.fingerprintMatches(parsed.authTokenFingerprint)) {
         console.error(
           `Discarding OAuth state from ${this.stateFile}: it was issued under a different ` +
@@ -302,30 +531,60 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
         return
       }
 
+      let droppedClients = 0
       for (const [clientId, client] of parsed.clients ?? []) {
+        // HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS may have been narrowed since
+        // (or the client predates it): such a client could still be sent
+        // through /authorize to a host that is no longer trusted.
+        if (!this.redirectUrisAllowed(client)) {
+          droppedClients++
+          continue
+        }
         this.clients.set(clientId, client)
       }
-      for (const [token, authInfo] of parsed.accessTokens ?? []) {
-        if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= now) {
-          continue
-        }
-        this.accessTokens.set(token, {
-          ...authInfo,
-          resource: authInfo.resource ? new URL(authInfo.resource as unknown as string) : undefined,
-        })
+      if (droppedClients > 0) {
+        console.error(
+          `Dropped ${droppedClients} persisted OAuth client(s) whose redirect URIs are no ` +
+            `longer allowed by HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS.`,
+        )
       }
-      for (const [token, refreshToken] of parsed.refreshTokens ?? []) {
-        // A missing expiresAt can only come from a hand-edited or foreign
-        // file; treat it as expired rather than as "never expires".
-        if (typeof refreshToken.expiresAt !== "number" || refreshToken.expiresAt <= now) {
-          continue
+
+      // Tokens are only kept for clients that survived above, so none
+      // outlives its client. A missing/non-numeric expiresAt can only come
+      // from a hand-edited or foreign file; it counts as expired rather
+      // than "never expires".
+      const isLive = (grant: unknown): grant is StoredAccessToken => {
+        const g = grant as Partial<StoredAccessToken> | null
+        return (
+          typeof g === "object" &&
+          g !== null &&
+          typeof g.clientId === "string" &&
+          this.clients.has(g.clientId) &&
+          isStringArray(g.scopes) &&
+          typeof g.expiresAt === "number" &&
+          g.expiresAt > now &&
+          // getValidAccessToken turns this into a URL; a malformed value
+          // would make every request with the token throw.
+          (g.resource === undefined || (typeof g.resource === "string" && URL.canParse(g.resource)))
+        )
+      }
+      for (const [hash, accessToken] of parsed.accessTokens ?? []) {
+        if (isSha256Hex(hash) && isLive(accessToken)) {
+          this.accessTokens.set(hash, accessToken)
         }
-        this.refreshTokens.set(token, refreshToken)
+      }
+      for (const [hash, refreshToken] of parsed.refreshTokens ?? []) {
+        if (isSha256Hex(hash) && isLive(refreshToken)) {
+          this.refreshTokens.set(hash, refreshToken as StoredRefreshToken)
+        }
       }
       console.error(
         `Restored OAuth state from ${this.stateFile} (${this.clients.size} client(s), ` +
           `${this.accessTokens.size} access token(s), ${this.refreshTokens.size} refresh token(s)).`,
       )
+      if (droppedClients > 0) {
+        this.persistState()
+      }
     } catch (error) {
       if (error instanceof StaleStateFileError) {
         throw error
@@ -368,8 +627,9 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * losing persistence should not break the OAuth flow that just
    * succeeded in memory.
    *
-   * The file holds plaintext 30-day bearer / 90-day refresh tokens, so it must land
-   * at 0600, and a crash mid-write must not corrupt existing state. Both
+   * Tokens are stored only as SHA-256 hashes, so the file can't be replayed
+   * as bearer tokens, but it still lists every client and grant, so it
+   * lands at 0600, and a crash mid-write must not corrupt existing state. Both
    * come from writing a uniquely-named temp file (mode set at creation —
    * `writeFileSync`'s `mode` option is only applied when the file doesn't
    * already exist yet, so writing in place over the target, or over a
@@ -377,14 +637,27 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * already there) and `renameSync`-ing it over the target, which is
    * atomic on the same filesystem.
    */
+  /**
+   * Hashes of tokens revoked in memory whose revocation hasn't reached the
+   * state file yet (the write failed), so the file could still revive
+   * them on restart. A retried revocation of one of these rewrites the
+   * file; unknown/foreign tokens stay a no-op. While any are pending, no
+   * new grant is issued (see `ensureRevocationsPersisted`). Cleared by the
+   * next successful write.
+   */
+  private readonly pendingRevocations = new Map<string, string>() // token hash -> client id
+
   private persistState(): boolean {
+    // Pruned even without a state file, so expired tokens never accumulate
+    // in memory either.
+    this.pruneExpiredTokens()
+
     if (!this.stateFile) {
       return true
     }
 
-    this.pruneExpiredTokens()
-
     const state: PersistedState = {
+      version: STATE_VERSION,
       authTokenFingerprint: this.authTokenFingerprint,
       clients: Array.from(this.clients.entries()),
       accessTokens: Array.from(this.accessTokens.entries()),
@@ -399,6 +672,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     try {
       fs.writeFileSync(tmpFile, JSON.stringify(state), { mode: 0o600 })
       fs.renameSync(tmpFile, this.stateFile)
+      this.pendingRevocations.clear()
       return true
     } catch (error) {
       try {
@@ -409,6 +683,20 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Failed to persist OAuth state to ${this.stateFile}: ${message}`)
       return false
+    }
+  }
+
+  /**
+   * Refuses to issue a new grant while a revocation hasn't reached the
+   * state file: the grant's own write could fail as well, and the process
+   * would keep serving on a file that still revives revoked tokens on
+   * restart. Retries the write first, so a recovered disk unblocks at once.
+   */
+  private ensureRevocationsPersisted(): void {
+    if (this.pendingRevocations.size > 0 && !this.persistState()) {
+      throw new ServerError(
+        "A token revocation has not been persisted yet; no new grants until the state file is writable",
+      )
     }
   }
 
@@ -426,15 +714,19 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * next state-file write). */
   private pruneExpiredTokens(): void {
     const now = Math.floor(Date.now() / 1000)
-    for (const [token, authInfo] of this.accessTokens) {
-      if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= now) {
-        this.accessTokens.delete(token)
+    for (const map of [this.accessTokens, this.refreshTokens]) {
+      for (const [hash, token] of map) {
+        if (token.expiresAt <= now) map.delete(hash)
       }
     }
-    for (const [token, refreshToken] of this.refreshTokens) {
-      if (refreshToken.expiresAt <= now) {
-        this.refreshTokens.delete(token)
-      }
+  }
+
+  /** Drops expired authorization codes. They are never persisted, so this
+   * only bounds memory; called whenever a new code is issued. */
+  private pruneExpiredAuthorizationCodes(): void {
+    const now = Date.now()
+    for (const [code, stored] of this.authorizationCodes) {
+      if (stored.expiresAt <= now) this.authorizationCodes.delete(code)
     }
   }
 
@@ -572,6 +864,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       return
     }
 
+    this.pruneExpiredAuthorizationCodes()
     const code = base64url(randomBytes(32))
     this.authorizationCodes.set(code, {
       clientId: client.client_id,
@@ -616,6 +909,8 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     if (!stored || stored.clientId !== client.client_id) {
       throw new InvalidGrantError("Invalid authorization code")
     }
+    // Before consuming the code, so a blocked exchange can be retried.
+    this.ensureRevocationsPersisted()
     this.authorizationCodes.delete(authorizationCode)
 
     if (stored.expiresAt <= Date.now()) {
@@ -628,56 +923,129 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     return this.issueTokens(client.client_id, stored.scopes, stored.resource)
   }
 
-  /** Exchanges a refresh token for a new access/refresh token pair. */
+  /**
+   * Exchanges a refresh token for a new access/refresh token pair. The
+   * refresh token rotates, and the access token issued alongside it is
+   * revoked, so each grant has at most one live pair. Requested scopes must
+   * be a subset of the original grant (RFC 6749 §6); none means the
+   * original scopes.
+   */
   async exchangeRefreshToken(
     client: OAuthClientInformationFull,
     refreshToken: string,
     scopes?: string[],
   ): Promise<OAuthTokens> {
-    const stored = this.refreshTokens.get(refreshToken)
+    const hash = hashToken(refreshToken)
+    const stored = this.refreshTokens.get(hash)
     if (!stored || stored.clientId !== client.client_id) {
       throw new InvalidGrantError("Invalid refresh token")
     }
-    this.refreshTokens.delete(refreshToken)
 
     if (stored.expiresAt <= Math.floor(Date.now() / 1000)) {
+      // Only the expired refresh token is dropped, not its paired access
+      // token (that one expires on its own). Nothing is revoked here, so a
+      // failed write can't resurrect anything: the refresh token is expired
+      // on disk too and is dropped again on load.
+      this.refreshTokens.delete(hash)
       this.persistState()
       throw new InvalidGrantError("Refresh token has expired")
     }
 
-    const grantedScopes = scopes && scopes.length > 0 ? scopes : stored.scopes
-    return this.issueTokens(client.client_id, grantedScopes, stored.resource)
+    // The SDK splits `scope` on single spaces, so "a  b" yields "".
+    const requested = (scopes ?? []).filter((scope) => scope.length > 0)
+    const granted = new Set(stored.scopes)
+    const excess = requested.filter((scope) => !granted.has(scope))
+    if (excess.length > 0) {
+      // Checked before rotating: an invalid_scope request leaves the
+      // refresh token usable.
+      throw new InvalidScopeError(`Scope exceeds the original grant: ${excess.join(" ")}`)
+    }
+
+    this.ensureRevocationsPersisted()
+
+    // Rotate transactionally: if the new state can't be written, the old
+    // pair would still be on disk and come back after a restart, so roll
+    // the in-memory maps back instead and fail the refresh. The client can
+    // retry with the same (still valid) refresh token.
+    const oldAccessHash = stored.accessTokenHash
+    const oldAccess = oldAccessHash ? this.accessTokens.get(oldAccessHash) : undefined
+    this.revokeRefreshToken(hash)
+    const grantedScopes = requested.length > 0 ? [...new Set(requested)] : stored.scopes
+    const issued = this.issueTokens(client.client_id, grantedScopes, stored.resource, {
+      persist: false,
+    })
+    if (!this.persistState()) {
+      this.accessTokens.delete(issued.accessTokenHash)
+      this.refreshTokens.delete(issued.refreshTokenHash)
+      this.refreshTokens.set(hash, stored)
+      if (oldAccessHash && oldAccess) {
+        this.accessTokens.set(oldAccessHash, oldAccess)
+      }
+      throw new ServerError("Could not persist rotated tokens; retry the refresh")
+    }
+    return issued.tokens
+  }
+
+  /** Deletes a refresh token and the access token issued with it. */
+  private revokeRefreshToken(hash: string): void {
+    const stored = this.refreshTokens.get(hash)
+    if (!stored) {
+      return
+    }
+    this.refreshTokens.delete(hash)
+    if (stored.accessTokenHash) {
+      this.accessTokens.delete(stored.accessTokenHash)
+    }
   }
 
   /** Issues a new access token (and rotating refresh token) for a client. */
-  private issueTokens(clientId: string, scopes: string[], resource?: string): OAuthTokens {
+  private issueTokens(clientId: string, scopes: string[], resource?: string): OAuthTokens
+  private issueTokens(
+    clientId: string,
+    scopes: string[],
+    resource: string | undefined,
+    options: { persist: false },
+  ): { tokens: OAuthTokens; accessTokenHash: string; refreshTokenHash: string }
+  private issueTokens(
+    clientId: string,
+    scopes: string[],
+    resource?: string,
+    options?: { persist: false },
+  ): OAuthTokens | { tokens: OAuthTokens; accessTokenHash: string; refreshTokenHash: string } {
     const accessToken = base64url(randomBytes(32))
     const refreshToken = base64url(randomBytes(32))
+    const accessTokenHash = hashToken(accessToken)
     const now = Math.floor(Date.now() / 1000)
-    const expiresAt = now + this.accessTokenTtlSeconds
 
-    this.accessTokens.set(accessToken, {
-      token: accessToken,
+    this.accessTokens.set(accessTokenHash, {
       clientId,
       scopes,
-      expiresAt,
-      resource: resource ? new URL(resource) : this.resource ? new URL(this.resource) : undefined,
+      expiresAt: now + this.accessTokenTtlSeconds,
+      resource: resource ?? this.resource,
     })
-    this.refreshTokens.set(refreshToken, {
+    const refreshTokenHash = hashToken(refreshToken)
+    this.refreshTokens.set(refreshTokenHash, {
       clientId,
       scopes,
       resource,
       expiresAt: now + this.refreshTokenTtlSeconds,
+      accessTokenHash,
     })
-    this.persistState()
 
-    return {
+    const tokens: OAuthTokens = {
       access_token: accessToken,
       token_type: "Bearer",
       expires_in: this.accessTokenTtlSeconds,
       refresh_token: refreshToken,
       scope: scopes.length > 0 ? scopes.join(" ") : undefined,
     }
+    if (options?.persist === false) {
+      return { tokens, accessTokenHash, refreshTokenHash }
+    }
+    // Best-effort for a fresh grant: a failed write only loses the new
+    // grant on restart (the connector logs in again), it never revives one.
+    this.persistState()
+    return tokens
   }
 
   /** Verifies an issued access token, returning its auth info or throwing. */
@@ -692,30 +1060,64 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   /**
    * Non-throwing lookup of a valid, unexpired access token. Returns
    * `undefined` when the token is unknown or expired (and prunes expired
-   * entries).
+   * entries). Only the hash is stored, so `token` in the result is the
+   * presented token itself.
    */
   public getValidAccessToken(token: string): AuthInfo | undefined {
-    const authInfo = this.accessTokens.get(token)
-    if (!authInfo) {
+    const hash = hashToken(token)
+    const stored = this.accessTokens.get(hash)
+    if (!stored) {
       return undefined
     }
-    if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= Math.floor(Date.now() / 1000)) {
-      this.accessTokens.delete(token)
+    if (stored.expiresAt <= Math.floor(Date.now() / 1000)) {
+      this.accessTokens.delete(hash)
       return undefined
     }
-    return authInfo
+    return {
+      token,
+      clientId: stored.clientId,
+      scopes: [...stored.scopes],
+      expiresAt: stored.expiresAt,
+      resource: stored.resource ? new URL(stored.resource) : undefined,
+    }
   }
 
-  /** Revokes an access or refresh token. */
+  /**
+   * Revokes an access or refresh token (RFC 7009). Only tokens issued to
+   * the requesting client are revoked; anything else is ignored, which the
+   * RFC's "respond 200 for invalid tokens" makes indistinguishable to the
+   * caller. Revoking a refresh token also revokes its paired access token.
+   */
   async revokeToken(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     request: { token: string; token_type_hint?: string },
   ): Promise<void> {
     if (!request.token) {
       throw new ServerError("Missing token to revoke")
     }
-    this.accessTokens.delete(request.token)
-    this.refreshTokens.delete(request.token)
-    this.persistState()
+    const hash = hashToken(request.token)
+    let revoked = false
+    if (this.accessTokens.get(hash)?.clientId === client.client_id) {
+      this.accessTokens.delete(hash)
+      revoked = true
+    }
+    if (this.refreshTokens.get(hash)?.clientId === client.client_id) {
+      this.revokeRefreshToken(hash)
+      revoked = true
+    }
+    // Unknown or foreign tokens are a successful no-op (RFC 7009), with no
+    // write attempted. The one exception is this client retrying a
+    // revocation whose earlier write failed: the token is already gone from
+    // memory, but the file still holds it, so it must be rewritten. A
+    // revocation stays in effect in memory either way (rolling it back
+    // would re-enable a token the client asked to kill), but until it's
+    // written it could come back after a restart (nothing durable can
+    // prevent that while the disk is failing), so that's reported
+    // instead of a false success.
+    const retryingPending = this.pendingRevocations.get(hash) === client.client_id
+    if ((revoked || retryingPending) && !this.persistState()) {
+      this.pendingRevocations.set(hash, client.client_id)
+      throw new ServerError("Token revoked in memory but could not be persisted; retry")
+    }
   }
 }

@@ -43,6 +43,26 @@ export interface RecordingStoreOptions {
   transcriptCacheSize?: number
 }
 
+/**
+ * A log-safe description of a decrypt/parse failure. Raw `err.message` is
+ * not safe: `JSON.parse` quotes a snippet of its input, which here is
+ * decrypted recording content. Only messages known to be content-free
+ * (our own ciphertext-shape errors, Node's GCM authentication failure) are
+ * passed through; anything else is reduced to its error class.
+ */
+export function safeErrorLabel(err: unknown): string {
+  if (err instanceof SyntaxError) {
+    return "invalid JSON (SyntaxError)"
+  }
+  if (
+    err instanceof Error &&
+    /^(invalid v1 ciphertext: |Unsupported state or unable to authenticate data$)/.test(err.message)
+  ) {
+    return err.message
+  }
+  return err instanceof Error ? err.name : "unknown error"
+}
+
 interface MetaRow {
   id: string
   user_id: string
@@ -244,7 +264,18 @@ export class RecordingStore {
       const byId = new Map<string, TranscriptText[]>()
       for (const row of rows.rows) {
         const texts = byId.get(row.recording_id) ?? []
-        texts.push({ source: row.source, text: decrypt(row.text, this.encryptionKey) })
+        try {
+          texts.push({ source: row.source, text: decrypt(row.text, this.encryptionKey) })
+        } catch (err) {
+          // Same reasoning as buildRecording(): one undecryptable transcript
+          // row (bad GCM tag) must not fail the whole batch. Log only the
+          // recording id/source + a content-free error label, and yield no
+          // text for that source instead of throwing.
+          console.error(
+            `[riffado-mcp] skipping transcript for recording ${row.recording_id} ` +
+              `(source ${row.source}): ${safeErrorLabel(err)}`,
+          )
+        }
         byId.set(row.recording_id, texts)
       }
       for (const id of misses) {
@@ -340,10 +371,20 @@ export class RecordingStore {
         }
       }
       for (const [id, rows] of rowsById) {
-        rebuiltById.set(id, this.buildRecording(rows))
+        try {
+          rebuiltById.set(id, this.buildRecording(rows))
+        } catch (err) {
+          // A bad GCM tag (decipher.final() throws) or invalid JSON in
+          // key_points/action_items for one recording must not break the
+          // whole refresh. Log only the id + a content-free label -- never the
+          // plaintext/ciphertext -- and skip that recording; it simply
+          // won't appear in this refresh (same as a deleted/trashed one).
+          console.error(`[riffado-mcp] skipping recording ${id}: ${safeErrorLabel(err)}`)
+        }
       }
     }
 
+    const fetched = new Set(toFetch)
     const recordings: Recording[] = []
     const recordingsById = new Map<string, Recording>()
     const normalizedFieldsById = new Map<string, NormalizedCheapFields>()
@@ -356,7 +397,10 @@ export class RecordingStore {
       if (rebuilt) {
         rec = rebuilt
         normalized = normalizedCheapFieldsFor(rec)
-      } else {
+      } else if (!fetched.has(id)) {
+        // Only unchanged ids reuse the previous snapshot. A changed id that
+        // failed to rebuild (corrupt ciphertext/JSON) or vanished between
+        // phase 1 and phase 2 must not fall back to its stale copy.
         rec = previous?.recordingsById.get(id)
         normalized = previous?.normalizedFieldsById.get(id)
         if (rec && normalized) {
@@ -364,7 +408,11 @@ export class RecordingStore {
         }
       }
       if (!rec || !normalized) {
-        continue // vanished between phase 1 and phase 2 -- drop it, same as any other absence
+        // Failed to rebuild or vanished between phase 1 and phase 2. Forget
+        // its stamp too, so the next refresh fetches it again instead of
+        // treating it as "unchanged" and leaving it out until the row changes.
+        stampsById.delete(id)
+        continue
       }
       recordings.push(rec)
       recordingsById.set(id, rec)

@@ -26,6 +26,11 @@ concurrency:
 jobs:
   build:
     name: Build (${{ matrix.platform }})
+    # workflow_dispatch is kept only to re-run a release for an existing tag
+    # (e.g. after a flaky build) -- never to publish `latest`/a fresh build
+    # from an arbitrary branch. A manual run must still be triggered against
+    # a `v*` tag ref.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -40,6 +45,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Lowercase repository owner
         run: echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "${GITHUB_ENV}"
@@ -155,15 +162,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - id: tag_message
         name: Read annotated tag message
         run: |
+          delim="EOF_$(openssl rand -hex 16)"
           {
-            echo 'body<<EOF'
+            echo "body<<${delim}"
             git tag -l --format='%(contents)' "${GITHUB_REF_NAME}"
-            echo EOF
+            echo "${delim}"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
