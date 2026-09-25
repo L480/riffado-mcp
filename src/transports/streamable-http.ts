@@ -40,7 +40,8 @@ export interface StreamableHttpServerOptions {
   publicUrl?: string
   /** Where the OAuth provider persists clients + tokens across restarts. */
   oauthStateFile?: string
-  /** Express `trust proxy` setting; required behind the Cloudflare Tunnel. */
+  /** Express `trust proxy` setting (default `false`); set it (e.g. `1`)
+   * behind a reverse proxy or the Cloudflare Tunnel. */
   trustProxy?: boolean | number | string
   corsOptions?: cors.CorsOptions
   requestTimeoutMs?: number

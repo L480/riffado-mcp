@@ -75,23 +75,23 @@ transcripts):
 
 ## Environment variables
 
-| Var                       | Default                           | Notes                                                                                                       |
-| ------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`            | _required_                        | `postgresql://postgres:…@riffado-db:5432/riffado`                                                           |
-| `ENCRYPTION_KEY`          | _required_                        | 64 hex chars (32-byte AES key)                                                                              |
-| `RIFFADO_USER_ID`         | —                                 | restrict to one user                                                                                        |
-| `RIFFADO_APP_URL`         | —                                 | e.g. `https://riffado.example.com` → deep links in tool output                                              |
-| `TRANSPORT`               | `stdio`                           | `stdio` \| `http`                                                                                           |
-| `HTTP_PORT` / `HTTP_HOST` | `3000` / `localhost`              | container sets host `0.0.0.0`                                                                               |
-| `HTTP_AUTH_TOKEN`         | _required for `http`_             | shared secret, min 32 chars; the HTTP transport refuses to start without it (unused on `stdio`)             |
-| `HTTP_AUTH_HEADER_NAME`   | `x-mcp-token`                     |                                                                                                             |
-| `HTTP_OAUTH_ENABLED`      | `true`                            | wraps `HTTP_AUTH_TOKEN` in an OAuth 2.1 login flow for Claude connectors                                    |
-| `HTTP_PUBLIC_URL`         | —                                 | OAuth issuer; must be HTTPS unless `localhost`                                                              |
-| `HTTP_OAUTH_STATE_FILE`   | `~/.riffado-mcp-oauth-state.json` | container: `/app/data/oauth-state.json`                                                                     |
-| `HTTP_TRUST_PROXY`        | `1`                               | Express `trust proxy`                                                                                       |
-| `HTTP_SESSION_TIMEOUT_MS` | `3600000` (1h)                    | idle-session expiry; `0` = no idle expiry (explicit opt-out, sessions close only on DELETE/transport close) |
-| `CACHE_TTL_MS`            | `60000`                           | decrypted-store TTL                                                                                         |
-| `DB_STATEMENT_TIMEOUT_MS` | `10000`                           | passed to the pg pool                                                                                       |
+| Var                       | Default                           | Notes                                                                                                                                                                          |
+| ------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `DATABASE_URL`            | _required_                        | `postgresql://postgres:…@riffado-db:5432/riffado`                                                                                                                              |
+| `ENCRYPTION_KEY`          | _required_                        | 64 hex chars (32-byte AES key)                                                                                                                                                 |
+| `RIFFADO_USER_ID`         | —                                 | restrict to one user                                                                                                                                                           |
+| `RIFFADO_APP_URL`         | —                                 | e.g. `https://riffado.example.com` → deep links in tool output                                                                                                                 |
+| `TRANSPORT`               | `stdio`                           | `stdio` \| `http`                                                                                                                                                              |
+| `HTTP_PORT` / `HTTP_HOST` | `3000` / `localhost`              | container sets host `0.0.0.0`                                                                                                                                                  |
+| `HTTP_AUTH_TOKEN`         | _required for `http`_             | shared secret, min 32 chars; the HTTP transport refuses to start without it (unused on `stdio`)                                                                                |
+| `HTTP_AUTH_HEADER_NAME`   | `x-mcp-token`                     |                                                                                                                                                                                |
+| `HTTP_OAUTH_ENABLED`      | `true`                            | wraps `HTTP_AUTH_TOKEN` in an OAuth 2.1 login flow for Claude connectors                                                                                                       |
+| `HTTP_PUBLIC_URL`         | —                                 | OAuth issuer; must be HTTPS unless `localhost`                                                                                                                                 |
+| `HTTP_OAUTH_STATE_FILE`   | `~/.riffado-mcp-oauth-state.json` | container: `/app/data/oauth-state.json`                                                                                                                                        |
+| `HTTP_TRUST_PROXY`        | `false`                           | Express `trust proxy`; **set it (e.g. `1`) behind a reverse proxy / Cloudflare Tunnel**, leave it off when clients connect directly (otherwise `X-Forwarded-For` is spoofable) |
+| `HTTP_SESSION_TIMEOUT_MS` | `3600000` (1h)                    | idle-session expiry; `0` = no idle expiry (explicit opt-out, sessions close only on DELETE/transport close)                                                                    |
+| `CACHE_TTL_MS`            | `60000`                           | decrypted-store TTL                                                                                                                                                            |
+| `DB_STATEMENT_TIMEOUT_MS` | `10000`                           | passed to the pg pool                                                                                                                                                          |
 
 ## Health checks
 
@@ -125,7 +125,9 @@ npm run build
 ## Quickstart: Claude Web / iOS (HTTP + OAuth)
 
 1. Run the container with `TRANSPORT=http`, `HTTP_PUBLIC_URL` set to the
-   public HTTPS URL, and `HTTP_AUTH_TOKEN` set to a shared secret.
+   public HTTPS URL, `HTTP_AUTH_TOKEN` set to a shared secret, and
+   `HTTP_TRUST_PROXY=1` if it sits behind a reverse proxy or Cloudflare
+   Tunnel.
 2. In Claude, add a custom connector pointing at
    `https://riffado-mcp.example.com/mcp`.
 3. Claude opens the login page; paste the `HTTP_AUTH_TOKEN` value. Claude
@@ -149,6 +151,9 @@ services:
       ENCRYPTION_KEY: "..."
       HTTP_PUBLIC_URL: https://riffado-mcp.example.com
       HTTP_AUTH_TOKEN: "..."
+      # Behind a reverse proxy / Cloudflare Tunnel (one hop). Omit when
+      # clients connect to the container directly.
+      HTTP_TRUST_PROXY: "1"
     volumes:
       - /opt/riffado-mcp/data:/app/data
     networks: [root_default]

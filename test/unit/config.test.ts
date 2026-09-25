@@ -38,8 +38,8 @@ describe("loadConfig", () => {
   })
 
   describe("HTTP_TRUST_PROXY coercion", () => {
-    it("defaults to 1", () => {
-      expect(loadConfig(BASE_ENV).HTTP_TRUST_PROXY).toBe(1)
+    it("defaults to false (X-Forwarded-For not trusted unless configured)", () => {
+      expect(loadConfig(BASE_ENV).HTTP_TRUST_PROXY).toBe(false)
     })
 
     it("coerces 'true'/'false'", () => {

@@ -30,6 +30,10 @@ That makes the deployment, not just the code, part of the security surface:
   It breaks the MCP OAuth flow (see [`docs/architecture.md`](./docs/architecture.md)),
   so the token _is_ the access control. Compensate with token length, not with
   a proxy that cannot work here.
+- **Set `HTTP_TRUST_PROXY` only when a proxy is actually in front.** It
+  defaults to `false`; behind a reverse proxy or Cloudflare Tunnel set it to
+  the hop count (usually `1`). Trusting `X-Forwarded-For` without a proxy lets
+  any client spoof its IP and sidestep the per-IP rate limits.
 - **Serve it over HTTPS only.** OAuth issuer URLs must be HTTPS anyway (the
   server refuses to enable OAuth otherwise, outside `localhost`), and the
   bearer token is sent on every request.

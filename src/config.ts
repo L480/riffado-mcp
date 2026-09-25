@@ -24,9 +24,13 @@ const boolFromString = (defaultValue: "true" | "false") =>
     .default(defaultValue)
     .transform((val) => val === "true")
 
+// Default `false`, matching StreamableHttpServer's own default: trusting
+// X-Forwarded-For when no proxy is actually in front lets any client spoof
+// its IP and dodge the per-IP rate limits. Set it (e.g. `1`) explicitly
+// when running behind a reverse proxy or Cloudflare Tunnel.
 const trustProxyCoercion = z
   .string()
-  .default("1")
+  .default("false")
   .transform((val): boolean | number | string => {
     if (val === "true") return true
     if (val === "false" || val === "") return false
