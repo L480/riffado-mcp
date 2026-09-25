@@ -22,13 +22,24 @@ export interface DbConfig {
 }
 
 export function createPool(config: DbConfig): pg.Pool {
-  return new pg.Pool({
+  const pool = new pg.Pool({
     connectionString: config.connectionString,
     options: "-c default_transaction_read_only=on",
     statement_timeout: config.statementTimeoutMs,
     max: config.maxConnections ?? 4,
     application_name: "riffado-mcp",
   })
+
+  // An idle client can error out from under us (e.g. the DB restarting or
+  // dropping the connection) — pg.Pool documents that without a listener
+  // here, that error is an uncaught 'error' event and crashes the process.
+  // Never log `error` itself or anything derived from the connection
+  // string; just the message.
+  pool.on("error", (err: Error) => {
+    console.error(`[riffado-mcp] idle pg client error: ${err.message}`)
+  })
+
+  return pool
 }
 
 /** Converts a `YYYY-MM-DD HH:MM:SS[.ffffff]` (no tz) string to ISO 8601 UTC. */
