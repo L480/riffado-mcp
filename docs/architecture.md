@@ -163,8 +163,12 @@ issued. Persisting a fresh grant is best-effort (a failed write only loses
 that grant on restart), but anything that removes access is not: a refresh
 whose rotated state can't be written is rolled back and fails, and a
 revocation that can't be written is reported as an error and blocks new
-grants until a retry (or any later write) gets it to disk, so a revoked
-token can never be resurrected from a stale file.
+grants until a retry (or any later write) gets it to disk. That holds as
+long as the process keeps running: a restart while the file is still
+unwritable reloads the stale file, and nothing durable can record the
+revocation when the disk is the thing that failed. The operator-facing
+remedy (fix the volume, retry, or rotate `HTTP_AUTH_TOKEN`) is in
+SECURITY.md.
 
 Dynamic client registration is open by spec, which makes two things
 attacker-controlled: the redirect URI and the registry size. Redirect URIs

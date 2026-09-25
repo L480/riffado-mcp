@@ -71,8 +71,13 @@ That makes the deployment, not just the code, part of the security surface:
   written, a refresh is rolled back (the old token keeps working, the client
   gets a server error and can retry) and a revocation is reported as failed
   instead of succeeding in memory only. Until such a revocation is written,
-  no new grant (code exchange or refresh) is issued, so no revoked token can
-  come back after a restart.
+  no new grant (code exchange or refresh) is issued. **Limit:** the
+  revocation holds in memory, but if the process restarts before the state
+  file is writable again, the old file still contains the token and it
+  comes back. No marker can prevent that, because a marker would need the
+  same unwritable disk. A server error from revocation therefore means:
+  make the state volume writable again and retry, then restart, or
+  rotate `HTTP_AUTH_TOKEN`, which discards the whole file.
 - **Upgrading from a pre-`version: 2` state file** (tokens stored unhashed)
   discards it on first start: every connector logs in again once.
 - **Rotating `HTTP_AUTH_TOKEN` revokes every OAuth grant.** The state file

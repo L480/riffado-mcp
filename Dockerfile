@@ -46,7 +46,7 @@ ENV HTTP_OAUTH_STATE_FILE=/app/data/oauth-state.json
 
 # JSON/exec form: shell form trips hadolint DL3025.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.HTTP_PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+((process.env.HTTP_PORT||'').trim()||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
 USER 7333
 

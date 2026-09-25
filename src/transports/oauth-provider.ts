@@ -1111,7 +1111,8 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     // memory, but the file still holds it, so it must be rewritten. A
     // revocation stays in effect in memory either way (rolling it back
     // would re-enable a token the client asked to kill), but until it's
-    // written it could come back after a restart, so that's reported
+    // written it could come back after a restart (nothing durable can
+    // prevent that while the disk is failing), so that's reported
     // instead of a false success.
     const retryingPending = this.pendingRevocations.get(hash) === client.client_id
     if ((revoked || retryingPending) && !this.persistState()) {
