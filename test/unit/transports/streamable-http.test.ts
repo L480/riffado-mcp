@@ -1,7 +1,10 @@
 import http from "http"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { StreamableHttpServer } from "../../../src/transports/streamable-http.js"
+
+const TOKEN = "test-shared-secret-test-shared-secret"
+const AUTH = { Authorization: `Bearer ${TOKEN}` }
 
 function stubServer(): McpServer {
   return new McpServer({ name: "test", version: "0.0.0" }, { capabilities: {} })
@@ -47,6 +50,7 @@ async function startServer(
   const server = new StreamableHttpServer({
     port: 0,
     host: "127.0.0.1",
+    authToken: TOKEN,
     enableRequestLogging: false,
     createServer: stubServer,
     ...overrides,
@@ -64,14 +68,54 @@ describe("StreamableHttpServer", () => {
     if (server) await server.stop().catch(() => {})
   })
 
-  it("provides a health check that is public even with auth configured", async () => {
-    ;({ server } = await startServer({ authToken: "secret" }))
+  it("refuses to construct without an auth token (no unauthenticated mode)", () => {
+    expect(
+      () =>
+        new StreamableHttpServer({
+          authToken: "",
+          enableRequestLogging: false,
+          createServer: stubServer,
+        }),
+    ).toThrow(/authToken/)
+    expect(
+      () =>
+        new StreamableHttpServer({
+          enableRequestLogging: false,
+          createServer: stubServer,
+        } as unknown as ConstructorParameters<typeof StreamableHttpServer>[0]),
+    ).toThrow(/authToken/)
+  })
+
+  it("rejects unauthenticated requests on the root MCP mount too", async () => {
+    ;({ server } = await startServer())
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+    const res = await request(port, "/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it("provides a health check that is public", async () => {
+    ;({ server } = await startServer())
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/health")
     expect(res.statusCode).toBe(200)
     const body = JSON.parse(res.body)
     expect(body.status).toBe("ok")
+  })
+
+  it("sets X-Content-Type-Options: nosniff on every response", async () => {
+    ;({ server } = await startServer())
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+    expect((await request(port, "/health")).headers["x-content-type-options"]).toBe("nosniff")
+    const unauthed = await request(port, "/mcp", { method: "POST", body: "{}" })
+    expect(unauthed.statusCode).toBe(401)
+    expect(unauthed.headers["x-content-type-options"]).toBe("nosniff")
   })
 
   it("exposes only status+timestamp on /health, nothing else", async () => {
@@ -95,7 +139,7 @@ describe("StreamableHttpServer", () => {
     }))
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
-    const res = await request(port, "/health/details")
+    const res = await request(port, "/health/details", { headers: AUTH })
     expect(res.statusCode).toBe(200)
     const body = JSON.parse(res.body)
     expect(body.database.reachable).toBe(true)
@@ -103,9 +147,8 @@ describe("StreamableHttpServer", () => {
     expect(typeof body.sessions).toBe("number")
   })
 
-  it("requires the same auth as /mcp on /health/details when a token is configured", async () => {
+  it("requires the same auth as /mcp on /health/details", async () => {
     ;({ server } = await startServer({
-      authToken: "secret",
       healthCheck: async () => ({ database: { reachable: true }, recordings: { cached: 0 } }),
     }))
     // @ts-expect-error private property access for test
@@ -115,25 +158,25 @@ describe("StreamableHttpServer", () => {
     expect(unauthedRes.statusCode).toBe(401)
 
     const authedRes = await request(port, "/health/details", {
-      headers: { Authorization: "Bearer secret" },
+      headers: AUTH,
     })
     expect(authedRes.statusCode).toBe(200)
   })
 
-  it("routes MCP requests posted to /mcp when unauthenticated (no authToken configured)", async () => {
+  it("routes authenticated MCP requests posted to /mcp", async () => {
     ;({ server } = await startServer())
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/mcp", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...AUTH },
       body: "{}",
     })
     expect(res.statusCode).not.toBe(404)
   })
 
-  it("requires authentication on /mcp when authToken is configured", async () => {
-    ;({ server } = await startServer({ authToken: "secret" }))
+  it("requires authentication on /mcp", async () => {
+    ;({ server } = await startServer())
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
 
@@ -150,7 +193,7 @@ describe("StreamableHttpServer", () => {
   })
 
   it("rejects a wrong custom-header token", async () => {
-    ;({ server } = await startServer({ authToken: "secret", authHeaderName: "x-api-token" }))
+    ;({ server } = await startServer({ authHeaderName: "x-api-token" }))
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/mcp", {
@@ -162,24 +205,24 @@ describe("StreamableHttpServer", () => {
   })
 
   it("accepts a correct custom-header token", async () => {
-    ;({ server } = await startServer({ authToken: "secret", authHeaderName: "x-api-token" }))
+    ;({ server } = await startServer({ authHeaderName: "x-api-token" }))
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/mcp", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-token": "secret" },
+      headers: { "Content-Type": "application/json", "x-api-token": TOKEN },
       body: "{}",
     })
     expect(res.statusCode).not.toBe(401)
   })
 
   it("accepts a correct raw bearer token", async () => {
-    ;({ server } = await startServer({ authToken: "secret" }))
+    ;({ server } = await startServer())
     // @ts-expect-error private property access for test
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/mcp", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
+      headers: { "Content-Type": "application/json", ...AUTH },
       body: "{}",
     })
     expect(res.statusCode).not.toBe(401)
@@ -191,7 +234,11 @@ describe("StreamableHttpServer", () => {
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/mcp", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "mcp-session-id": "does-not-exist" },
+      headers: {
+        "Content-Type": "application/json",
+        "mcp-session-id": "does-not-exist",
+        ...AUTH,
+      },
       body: "{}",
     })
     expect(res.statusCode).toBe(404)
@@ -203,7 +250,7 @@ describe("StreamableHttpServer", () => {
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/mcp", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...AUTH },
       body: "{}",
     })
     expect(res.statusCode).toBe(400)
@@ -215,7 +262,7 @@ describe("StreamableHttpServer", () => {
     const port = (server.server as http.Server).address().port
     const res = await request(port, "/", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...AUTH },
       body: "{}",
     })
     expect(res.statusCode).not.toBe(404)
@@ -231,6 +278,7 @@ describe("StreamableHttpServer", () => {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
+        ...AUTH,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -250,7 +298,7 @@ describe("StreamableHttpServer", () => {
 
     const deleteRes = await request(port, "/mcp", {
       method: "DELETE",
-      headers: { "mcp-session-id": sessionId },
+      headers: { "mcp-session-id": sessionId, ...AUTH },
     })
     expect(deleteRes.statusCode).toBeLessThan(400)
     expect(server.getActiveSessions()).not.toContain(sessionId)
@@ -285,6 +333,7 @@ describe("StreamableHttpServer", () => {
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
+        ...AUTH,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -328,5 +377,93 @@ describe("StreamableHttpServer", () => {
       // @ts-expect-error private property access for test
       expect(server.options.sessionTimeoutMs).toBe(3600000)
     })
+  })
+
+  it("logs only the request path, never the query string", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      ;({ server } = await startServer({ enableRequestLogging: true }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      await request(port, "/health?code=leaky-code&state=leaky-state")
+      const lines = log.mock.calls.map((args) => args.join(" "))
+      expect(lines.some((l) => l.includes("GET /health"))).toBe(true)
+      expect(lines.some((l) => l.includes("leaky-code") || l.includes("leaky-state"))).toBe(false)
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it("reports a degraded /health/details without leaking the internal error", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      ;({ server } = await startServer({
+        healthCheck: async () => {
+          throw new Error("connect ECONNREFUSED 10.0.0.5:5432 password=hunter2")
+        },
+      }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      const res = await request(port, "/health/details", { headers: AUTH })
+      expect(res.statusCode).toBe(200)
+      const body = JSON.parse(res.body)
+      expect(body.status).toBe("degraded")
+      expect(body.error).toBe("Health check failed")
+      expect(res.body).not.toContain("ECONNREFUSED")
+      expect(res.body).not.toContain("hunter2")
+      // The real error still reaches stderr for the operator.
+      expect(log.mock.calls.flat().some((a) => String(a).includes("ECONNREFUSED"))).toBe(true)
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it("returns a generic message for non-session errors on the MCP route", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      ;({ server } = await startServer({
+        createServer: () => {
+          throw new Error("internal detail: /srv/secret/path")
+        },
+      }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      const res = await request(port, "/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...AUTH,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "test", version: "0.0.0" },
+          },
+        }),
+      })
+      expect(res.statusCode).toBe(500)
+      expect(JSON.parse(res.body).error.message).toBe("Internal error")
+      expect(res.body).not.toContain("/srv/secret/path")
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it("still returns SessionError messages to the client", async () => {
+    ;({ server } = await startServer())
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+    const res = await request(port, "/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "mcp-session-id": "nope", ...AUTH },
+      body: "{}",
+    })
+    expect(res.statusCode).toBe(404)
+    expect(JSON.parse(res.body).error.message).toBe("Session not found or expired")
   })
 })

@@ -5,7 +5,7 @@
  * authenticate against a shared secret. Same shape, renamed for Riffado.
  */
 import { Response } from "express"
-import { randomUUID, randomBytes, timingSafeEqual } from "crypto"
+import { createHmac, randomUUID, randomBytes, timingSafeEqual } from "crypto"
 import fs from "fs"
 import path from "path"
 import type {
@@ -34,6 +34,12 @@ export interface StaticTokenOAuthOptions {
   resource?: string
   /** Lifetime of issued access tokens in seconds (default: 30 days). */
   accessTokenTtlSeconds?: number
+  /**
+   * Lifetime of issued refresh tokens in seconds (default: 90 days). Each
+   * refresh rotates the token and starts a fresh lifetime, so this bounds
+   * how long an *idle* connector stays logged in, not an active one.
+   */
+  refreshTokenTtlSeconds?: number
   /** Lifetime of an authorization code in seconds (default: 5 minutes). */
   authorizationCodeTtlSeconds?: number
   /** Human readable name displayed on the login page. */
@@ -57,6 +63,13 @@ export interface StaticTokenOAuthOptions {
 }
 
 interface PersistedState {
+  /**
+   * HMAC of the shared token the state was issued under (never the token
+   * itself). On load, a missing or different value means `HTTP_AUTH_TOKEN`
+   * was rotated since, and everything in the file is discarded — rotating
+   * the secret must also revoke every OAuth grant obtained with the old one.
+   */
+  authTokenFingerprint?: string
   clients: [string, OAuthClientInformationFull][]
   accessTokens: [string, AuthInfo][]
   refreshTokens: [string, StoredRefreshToken][]
@@ -75,6 +88,24 @@ interface StoredRefreshToken {
   clientId: string
   scopes: string[]
   resource?: string
+  /** Expiry as epoch seconds, same unit as `AuthInfo.expiresAt`. */
+  expiresAt: number
+}
+
+/**
+ * Thrown when the state file exists but can't be verified or cleared: it
+ * may hold grants issued under a previous auth token, so the server must
+ * not start (a later restart with that token would resurrect them).
+ */
+export class StaleStateFileError extends Error {}
+
+/** Fixed HMAC message: the fingerprint is keyed by the token, so it can't be
+ * compared against a plain SHA-256 of the token computed anywhere else. */
+const FINGERPRINT_CONTEXT = "riffado-mcp:oauth-state:auth-token-fingerprint:v1"
+
+/** Fingerprint of the shared token for the state file. */
+function fingerprintAuthToken(authToken: string): string {
+  return createHmac("sha256", authToken).update(FINGERPRINT_CONTEXT).digest("hex")
 }
 
 /** Escapes a string for safe inclusion inside an HTML attribute or text node. */
@@ -85,6 +116,42 @@ function escapeHtml(value: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;")
+}
+
+/**
+ * A CSP source expression for the origin of `url`, or `undefined` if it
+ * can't be expressed safely. WHATWG URL parsing lets characters such as
+ * `;`, `,` and `'` through in hostnames, and those would break out of the
+ * directive (header injection into our own CSP), so anything beyond a plain
+ * `scheme://host[:port]` falls back to a bare scheme source (`https:`),
+ * and custom-scheme redirect URIs (opaque origin, e.g. `cursor://…`) use
+ * the scheme source too.
+ */
+export function cspSourceFor(url: string): string | undefined {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return undefined
+  }
+  const schemeSource = /^[a-z][a-z0-9+.-]*:$/i.test(parsed.protocol) ? parsed.protocol : undefined
+  if (parsed.origin !== "null" && /^[a-z][a-z0-9+.-]*:\/\/[a-z0-9.\-[\]:]+$/i.test(parsed.origin)) {
+    return parsed.origin
+  }
+  return schemeSource
+}
+
+/** Where a redirect URI sends the user, for display on the login page. */
+function redirectTargetLabel(redirectUri: string): string {
+  try {
+    const parsed = new URL(redirectUri)
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      return parsed.host
+    }
+    return parsed.host ? `${parsed.protocol}//${parsed.host}` : parsed.protocol
+  } catch {
+    return redirectUri
+  }
 }
 
 /** Base64url-encodes a buffer without padding, suitable for opaque tokens. */
@@ -105,9 +172,11 @@ function base64url(buffer: Buffer): string {
  */
 export class StaticTokenOAuthProvider implements OAuthServerProvider {
   private readonly authTokenBuffer: Buffer
+  private readonly authTokenFingerprint: string
   private readonly authorizeEndpoint: string
   private readonly resource?: string
   private readonly accessTokenTtlSeconds: number
+  private readonly refreshTokenTtlSeconds: number
   private readonly authorizationCodeTtlSeconds: number
   private readonly serverName: string
   private readonly stateFile?: string
@@ -120,9 +189,11 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
 
   constructor(options: StaticTokenOAuthOptions) {
     this.authTokenBuffer = Buffer.from(options.authToken)
+    this.authTokenFingerprint = fingerprintAuthToken(options.authToken)
     this.authorizeEndpoint = options.authorizeEndpoint
     this.resource = options.resource
     this.accessTokenTtlSeconds = options.accessTokenTtlSeconds ?? 30 * 24 * 60 * 60
+    this.refreshTokenTtlSeconds = options.refreshTokenTtlSeconds ?? 90 * 24 * 60 * 60
     this.authorizationCodeTtlSeconds = options.authorizationCodeTtlSeconds ?? 5 * 60
     this.serverName = options.serverName ?? "Riffado MCP"
     this.stateFile = options.stateFile
@@ -188,6 +259,12 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * configured. Reads synchronously so state is available before the
    * server starts accepting requests. Missing or corrupt files are treated
    * as "no prior state" rather than a fatal error.
+   *
+   * State issued under a different shared token (fingerprint mismatch, or
+   * no fingerprint at all) is discarded wholesale and the file rewritten
+   * empty, so rotating `HTTP_AUTH_TOKEN` revokes every client and token
+   * obtained with the old one. Expired access and refresh tokens are
+   * dropped too.
    */
   private loadState(): void {
     if (!this.stateFile) {
@@ -197,19 +274,39 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     let raw: string
     try {
       raw = fs.readFileSync(this.stateFile, "utf-8")
-    } catch {
-      return
+    } catch (error) {
+      // Only a missing file means "no prior state". Any other read error
+      // leaves a file whose fingerprint we can't check on disk, so fail
+      // closed rather than start and let it be trusted on a later restart.
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      throw new StaleStateFileError(
+        `Could not read OAuth state file ${this.stateFile} (${message}). Refusing to start: ` +
+          `its token fingerprint can't be verified. Fix its permissions or delete it.`,
+      )
     }
 
     try {
       const parsed = JSON.parse(raw) as Partial<PersistedState>
       const now = Math.floor(Date.now() / 1000)
 
+      if (!this.fingerprintMatches(parsed.authTokenFingerprint)) {
+        console.error(
+          `Discarding OAuth state from ${this.stateFile}: it was issued under a different ` +
+            `HTTP_AUTH_TOKEN (or predates token fingerprinting). All previously registered ` +
+            `clients and issued tokens are revoked; connectors must log in again.`,
+        )
+        this.discardStaleStateFile()
+        return
+      }
+
       for (const [clientId, client] of parsed.clients ?? []) {
         this.clients.set(clientId, client)
       }
       for (const [token, authInfo] of parsed.accessTokens ?? []) {
-        if (authInfo.expiresAt !== undefined && authInfo.expiresAt < now) {
+        if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= now) {
           continue
         }
         this.accessTokens.set(token, {
@@ -218,24 +315,60 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
         })
       }
       for (const [token, refreshToken] of parsed.refreshTokens ?? []) {
+        // A missing expiresAt can only come from a hand-edited or foreign
+        // file; treat it as expired rather than as "never expires".
+        if (typeof refreshToken.expiresAt !== "number" || refreshToken.expiresAt <= now) {
+          continue
+        }
         this.refreshTokens.set(token, refreshToken)
       }
       console.error(
-        `Restored OAuth state from ${this.stateFile} (${this.clients.size} client(s), ${this.accessTokens.size} access token(s)).`,
+        `Restored OAuth state from ${this.stateFile} (${this.clients.size} client(s), ` +
+          `${this.accessTokens.size} access token(s), ${this.refreshTokens.size} refresh token(s)).`,
       )
     } catch (error) {
+      if (error instanceof StaleStateFileError) {
+        throw error
+      }
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Ignoring unreadable OAuth state file ${this.stateFile}: ${message}`)
     }
   }
 
   /**
+   * Replaces a state file issued under a different shared token with an
+   * empty one. Unlike every other persist, this one must not be
+   * best-effort: if the stale file survived, the next restart with the old
+   * token would match its fingerprint again and resurrect every revoked
+   * client and token. So fall back to deleting it, and if even that fails,
+   * refuse to start.
+   */
+  private discardStaleStateFile(): void {
+    if (this.persistState()) {
+      return
+    }
+    try {
+      fs.unlinkSync(this.stateFile!)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      throw new StaleStateFileError(
+        `Could not replace or delete stale OAuth state file ${this.stateFile} (${message}). ` +
+          `Refusing to start: it holds tokens issued under a previous HTTP_AUTH_TOKEN. ` +
+          `Delete it manually or make its directory writable.`,
+      )
+    }
+  }
+
+  /**
    * Persists clients and tokens to `stateFile`, if configured. Best-effort:
-   * a write failure is logged but never surfaced to the caller, since
+   * a write failure is logged and reported via the return value, never thrown, since
    * losing persistence should not break the OAuth flow that just
    * succeeded in memory.
    *
-   * The file holds plaintext 30-day bearer/refresh tokens, so it must land
+   * The file holds plaintext 30-day bearer / 90-day refresh tokens, so it must land
    * at 0600, and a crash mid-write must not corrupt existing state. Both
    * come from writing a uniquely-named temp file (mode set at creation —
    * `writeFileSync`'s `mode` option is only applied when the file doesn't
@@ -244,12 +377,15 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * already there) and `renameSync`-ing it over the target, which is
    * atomic on the same filesystem.
    */
-  private persistState(): void {
+  private persistState(): boolean {
     if (!this.stateFile) {
-      return
+      return true
     }
 
+    this.pruneExpiredTokens()
+
     const state: PersistedState = {
+      authTokenFingerprint: this.authTokenFingerprint,
       clients: Array.from(this.clients.entries()),
       accessTokens: Array.from(this.accessTokens.entries()),
       refreshTokens: Array.from(this.refreshTokens.entries()),
@@ -263,6 +399,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     try {
       fs.writeFileSync(tmpFile, JSON.stringify(state), { mode: 0o600 })
       fs.renameSync(tmpFile, this.stateFile)
+      return true
     } catch (error) {
       try {
         fs.unlinkSync(tmpFile)
@@ -271,6 +408,33 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       }
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Failed to persist OAuth state to ${this.stateFile}: ${message}`)
+      return false
+    }
+  }
+
+  /** Whether a persisted fingerprint matches the current shared token. */
+  private fingerprintMatches(persisted: unknown): boolean {
+    if (typeof persisted !== "string") {
+      return false
+    }
+    const provided = Buffer.from(persisted)
+    const expected = Buffer.from(this.authTokenFingerprint)
+    return provided.length === expected.length && timingSafeEqual(provided, expected)
+  }
+
+  /** Drops expired access and refresh tokens from memory (and so from the
+   * next state-file write). */
+  private pruneExpiredTokens(): void {
+    const now = Math.floor(Date.now() / 1000)
+    for (const [token, authInfo] of this.accessTokens) {
+      if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= now) {
+        this.accessTokens.delete(token)
+      }
+    }
+    for (const [token, refreshToken] of this.refreshTokens) {
+      if (refreshToken.expiresAt <= now) {
+        this.refreshTokens.delete(token)
+      }
     }
   }
 
@@ -331,7 +495,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
 <body>
   <form class="card" method="post" action="${escapeHtml(this.authorizeEndpoint)}">
     <h1>Connect to ${escapeHtml(this.serverName)}</h1>
-    <p>${clientLabel} wants to connect. Enter the access token to authorize.</p>
+    <p>${clientLabel} wants to connect and will be redirected to <strong>${escapeHtml(redirectTargetLabel(params.redirectUri))}</strong>. Only continue if you expect that. Enter the access token to authorize.</p>
     ${errorBlock}
     <label for="mcp_auth_token">Access token</label>
     <input id="mcp_auth_token" name="mcp_auth_token" type="password" autocomplete="off" autofocus required />
@@ -350,6 +514,34 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   }
 
   /**
+   * Hardening headers for every response `authorize()` produces. The login
+   * page needs only its inline `<style>` and a form post; `form-action`
+   * covers the authorize endpoint the form posts to *and* the client's
+   * redirect origin, because some browsers apply `form-action` to the 302
+   * that follows a successful login too.
+   */
+  private setAuthorizeSecurityHeaders(res: Response, redirectUri: string): void {
+    const formAction = new Set(["'self'"])
+    for (const source of [cspSourceFor(this.authorizeEndpoint), cspSourceFor(redirectUri)]) {
+      if (source) formAction.add(source)
+    }
+    res.setHeader(
+      "Content-Security-Policy",
+      [
+        "default-src 'none'",
+        "style-src 'unsafe-inline'",
+        `form-action ${[...formAction].join(" ")}`,
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+      ].join("; "),
+    )
+    res.setHeader("X-Frame-Options", "DENY")
+    res.setHeader("Referrer-Policy", "no-referrer")
+    res.setHeader("Cache-Control", "no-store")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+  }
+
+  /**
    * Handles the authorization endpoint. On the initial GET a login page is
    * rendered; once the correct token is submitted an authorization code is
    * issued and the user agent is redirected back to the client.
@@ -359,10 +551,14 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    const req = res.req as { body?: Record<string, unknown>; query?: Record<string, unknown> }
-    const submitted =
-      (req?.body?.mcp_auth_token as string | undefined) ??
-      (req?.query?.mcp_auth_token as string | undefined)
+    // The shared secret is only ever read from a POST body. A query-string
+    // copy (`GET /authorize?...&mcp_auth_token=...`) would land in browser
+    // history, proxy/access logs and Referer headers, so it's ignored and
+    // the login page is shown instead.
+    const req = res.req as { method?: string; body?: Record<string, unknown> } | undefined
+    const submitted = req?.method === "POST" ? req.body?.mcp_auth_token : undefined
+
+    this.setAuthorizeSecurityHeaders(res, params.redirectUri)
 
     if (typeof submitted !== "string" || submitted.length === 0) {
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8")
@@ -422,7 +618,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     }
     this.authorizationCodes.delete(authorizationCode)
 
-    if (stored.expiresAt < Date.now()) {
+    if (stored.expiresAt <= Date.now()) {
       throw new InvalidGrantError("Authorization code has expired")
     }
     if (redirectUri !== undefined && redirectUri !== stored.redirectUri) {
@@ -444,6 +640,11 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     }
     this.refreshTokens.delete(refreshToken)
 
+    if (stored.expiresAt <= Math.floor(Date.now() / 1000)) {
+      this.persistState()
+      throw new InvalidGrantError("Refresh token has expired")
+    }
+
     const grantedScopes = scopes && scopes.length > 0 ? scopes : stored.scopes
     return this.issueTokens(client.client_id, grantedScopes, stored.resource)
   }
@@ -452,7 +653,8 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   private issueTokens(clientId: string, scopes: string[], resource?: string): OAuthTokens {
     const accessToken = base64url(randomBytes(32))
     const refreshToken = base64url(randomBytes(32))
-    const expiresAt = Math.floor(Date.now() / 1000) + this.accessTokenTtlSeconds
+    const now = Math.floor(Date.now() / 1000)
+    const expiresAt = now + this.accessTokenTtlSeconds
 
     this.accessTokens.set(accessToken, {
       token: accessToken,
@@ -461,7 +663,12 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       expiresAt,
       resource: resource ? new URL(resource) : this.resource ? new URL(this.resource) : undefined,
     })
-    this.refreshTokens.set(refreshToken, { clientId, scopes, resource })
+    this.refreshTokens.set(refreshToken, {
+      clientId,
+      scopes,
+      resource,
+      expiresAt: now + this.refreshTokenTtlSeconds,
+    })
     this.persistState()
 
     return {
@@ -492,7 +699,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     if (!authInfo) {
       return undefined
     }
-    if (authInfo.expiresAt !== undefined && authInfo.expiresAt < Math.floor(Date.now() / 1000)) {
+    if (authInfo.expiresAt !== undefined && authInfo.expiresAt <= Math.floor(Date.now() / 1000)) {
       this.accessTokens.delete(token)
       return undefined
     }

@@ -122,6 +122,39 @@ describe("StreamableHttpServer OAuth flow", () => {
     expect(res.body).toContain("Connect to Riffado MCP")
   })
 
+  it("serves the login page with anti-framing / no-store / CSP headers", async () => {
+    const registerRes = await request(port, "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["http://localhost/callback"],
+        token_endpoint_auth_method: "none",
+      }),
+    })
+    const client = JSON.parse(registerRes.body)
+    const res = await request(
+      port,
+      `/authorize?response_type=code&client_id=${client.client_id}&redirect_uri=http://localhost/callback&code_challenge=x&code_challenge_method=S256`,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toContain("will be redirected to <strong>localhost</strong>")
+    expect(res.headers["x-frame-options"]).toBe("DENY")
+    expect(res.headers["referrer-policy"]).toBe("no-referrer")
+    expect(res.headers["cache-control"]).toBe("no-store")
+    expect(res.headers["x-content-type-options"]).toBe("nosniff")
+    expect(res.headers["content-security-policy"]).toContain("form-action 'self'")
+    expect(res.headers["content-security-policy"]).toContain("http://localhost")
+    expect(res.headers["content-security-policy"]).toContain("frame-ancestors 'none'")
+  })
+
+  it("sets baseline hardening headers on /authorize errors from the SDK too", async () => {
+    const res = await request(port, "/authorize?client_id=unknown")
+    expect(res.statusCode).toBeGreaterThanOrEqual(400)
+    expect(res.headers["x-frame-options"]).toBe("DENY")
+    expect(res.headers["cache-control"]).toBe("no-store")
+    expect(res.headers["content-security-policy"]).toContain("frame-ancestors 'none'")
+  })
+
   it("escapes HTML in the client name on the login page", async () => {
     const registerRes = await request(port, "/register", {
       method: "POST",
@@ -139,6 +172,25 @@ describe("StreamableHttpServer OAuth flow", () => {
     )
     expect(res.body).not.toContain("<script>alert(1)</script>")
     expect(res.body).toContain("&lt;script&gt;")
+  })
+
+  it("never accepts the shared token from the /authorize query string", async () => {
+    const registerRes = await request(port, "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["http://localhost/callback"],
+        token_endpoint_auth_method: "none",
+      }),
+    })
+    const client = JSON.parse(registerRes.body)
+    const res = await request(
+      port,
+      `/authorize?response_type=code&client_id=${client.client_id}&redirect_uri=http://localhost/callback&code_challenge=x&code_challenge_method=S256&mcp_auth_token=super-secret-token`,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(res.headers.location).toBeUndefined()
+    expect(res.body).toContain('name="mcp_auth_token"')
   })
 
   it("completes the full authorization-code + PKCE flow and issues a usable token", async () => {
@@ -361,7 +413,7 @@ describe("StreamableHttpServer OAuth state persistence across restarts", () => {
   })
 
   afterEach(() => {
-    fs.rmSync(stateFile, { force: true })
+    fs.rmSync(stateFile, { force: true, recursive: true })
   })
 
   const startServer = async (): Promise<{ server: StreamableHttpServer; port: number }> => {
@@ -453,6 +505,24 @@ describe("StreamableHttpServer OAuth state persistence across restarts", () => {
     } finally {
       await server2.stop()
     }
+  })
+
+  it("refuses to start when the state file exists but can't be read", () => {
+    // A directory at the state path makes readFileSync fail with EISDIR --
+    // a real non-ENOENT read error, even when the tests run as root.
+    fs.mkdirSync(stateFile)
+    expect(
+      () =>
+        new StreamableHttpServer({
+          port: 0,
+          host: "127.0.0.1",
+          authToken: "super-secret-token",
+          publicUrl: "http://localhost",
+          enableRequestLogging: false,
+          oauthStateFile: stateFile,
+          createServer: stubServer,
+        }),
+    ).toThrow(/Refusing to start/)
   })
 
   it("tolerates a corrupt state file instead of failing to start", async () => {

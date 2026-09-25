@@ -125,7 +125,10 @@ The pg pool starts every session with `-c default_transaction_read_only=on`.
 Postgres itself then rejects any `INSERT`/`UPDATE`/`DELETE` — the guarantee
 lives at the database layer, not in application code, so a bug or a prompt
 injection in a tool handler cannot mutate Riffado no matter what SQL it
-tries to build (all queries are parameterized `SELECT`s regardless).
+tries to build (all queries are parameterized `SELECT`s regardless). A
+dedicated role with only `SELECT` grants (see README) is recommended on top:
+a session-level default can in principle be overridden within the session,
+a missing grant cannot.
 
 ## OAuth wraps a static token
 
@@ -137,6 +140,17 @@ login page, and in exchange receives a normal OAuth access token used as
 `Authorization: Bearer <token>` on every request after. The shared token
 itself (as a raw bearer or the `x-mcp-token` header) still works directly,
 for stdio-adjacent or scripted use.
+
+Clients and tokens are persisted to `HTTP_OAUTH_STATE_FILE` so the
+connector survives restarts. The file also carries an HMAC-SHA256
+fingerprint of the shared token (keyed by the token, never the token
+itself); if it is missing or doesn't match the current `HTTP_AUTH_TOKEN`,
+everything in the file is discarded on load. Every OAuth grant descends from
+someone knowing the shared token, so rotating that token has to revoke them
+all — otherwise a leaked refresh token would outlive the secret it was
+obtained with. Access tokens expire after 30 days, refresh tokens after 90
+(each refresh rotates the refresh token and restarts that clock); expired
+ones are dropped on load, on refresh, and on every state write.
 
 ## Don't put an identity-aware proxy in front
 

@@ -2,8 +2,9 @@ import fs from "fs"
 import os from "os"
 import path from "path"
 import { randomBytes } from "crypto"
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
-import { StaticTokenOAuthProvider } from "../../../src/transports/oauth-provider.js"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { Response } from "express"
+import { StaticTokenOAuthProvider, cspSourceFor } from "../../../src/transports/oauth-provider.js"
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js"
 
 function clientMetadata(
@@ -14,6 +15,71 @@ function clientMetadata(
     token_endpoint_auth_method: "none",
     client_name: name,
   }
+}
+
+const TOKEN = "secret"
+const DAY = 24 * 60 * 60 * 1000
+
+interface FakeResponse {
+  statusCode: number
+  headers: Record<string, string>
+  body?: string
+  location?: string
+}
+
+/** Minimal stand-in for the Express response `authorize()` writes to. */
+function fakeResponse(req: {
+  method: string
+  body?: Record<string, unknown>
+  query?: Record<string, unknown>
+}): { res: Response; out: FakeResponse } {
+  const out: FakeResponse = { statusCode: 200, headers: {} }
+  const res = {
+    req,
+    status(code: number) {
+      out.statusCode = code
+      return res
+    },
+    setHeader(name: string, value: string) {
+      out.headers[name.toLowerCase()] = value
+      return res
+    },
+    send(body: string) {
+      out.body = body
+      return res
+    },
+    redirect(code: number, url: string) {
+      out.statusCode = code
+      out.location = url
+    },
+  }
+  return { res: res as unknown as Response, out }
+}
+
+function newProvider(
+  overrides: Partial<ConstructorParameters<typeof StaticTokenOAuthProvider>[0]> = {},
+): StaticTokenOAuthProvider {
+  return new StaticTokenOAuthProvider({
+    authToken: TOKEN,
+    authorizeEndpoint: "http://localhost/authorize",
+    ...overrides,
+  })
+}
+
+/** Runs register -> authorize (POST with the shared token) -> code exchange. */
+async function issueTokens(provider: StaticTokenOAuthProvider) {
+  const client = provider.clientsStore.registerClient!(
+    clientMetadata("c"),
+  ) as OAuthClientInformationFull
+  const { res, out } = fakeResponse({ method: "POST", body: { mcp_auth_token: TOKEN } })
+  await provider.authorize(
+    client,
+    { redirectUri: "http://localhost/callback", codeChallenge: "challenge", scopes: [] },
+    res,
+  )
+  const code = new URL(out.location!).searchParams.get("code")!
+  const tokens = await provider.exchangeAuthorizationCode(client, code)
+  return { client, tokens }
 }
 
 describe("StaticTokenOAuthProvider client registry cap", () => {
@@ -142,5 +208,331 @@ describe("StaticTokenOAuthProvider state file", () => {
       stateFile,
     })
     expect(provider2.clientsStore.getClient(client.client_id)).toBeDefined()
+  })
+})
+
+describe("StaticTokenOAuthProvider token rotation revokes persisted state", () => {
+  let stateFile: string
+
+  beforeEach(() => {
+    stateFile = path.join(
+      os.tmpdir(),
+      `riffado-mcp-oauth-rotation-test-${randomBytes(8).toString("hex")}.json`,
+    )
+  })
+
+  afterEach(() => {
+    fs.rmSync(stateFile, { force: true })
+    vi.restoreAllMocks()
+  })
+
+  it("persists a fingerprint of the shared token, never the token itself", async () => {
+    const authToken = "a-very-distinctive-shared-secret-value-0123456789"
+    const provider = newProvider({ authToken, stateFile })
+    provider.clientsStore.registerClient!(clientMetadata("c1"))
+
+    const raw = fs.readFileSync(stateFile, "utf-8")
+    expect(raw).not.toContain(authToken)
+    const state = JSON.parse(raw)
+    expect(state.authTokenFingerprint).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  it("keeps clients and tokens across a restart with the same token", async () => {
+    const provider1 = newProvider({ stateFile })
+    const { client, tokens } = await issueTokens(provider1)
+
+    const provider2 = newProvider({ stateFile })
+    expect(provider2.clientsStore.getClient(client.client_id)).toBeDefined()
+    expect(provider2.getValidAccessToken(tokens.access_token)).toBeDefined()
+    await expect(
+      provider2.exchangeRefreshToken(client, tokens.refresh_token!),
+    ).resolves.toHaveProperty("access_token")
+  })
+
+  it("discards all clients and tokens when the shared token was rotated", async () => {
+    const provider1 = newProvider({ stateFile })
+    const { client, tokens } = await issueTokens(provider1)
+
+    const log = vi.spyOn(console, "error").mockImplementation(() => {})
+    const provider2 = newProvider({ authToken: "rotated-secret", stateFile })
+
+    expect(provider2.clientsStore.getClient(client.client_id)).toBeUndefined()
+    expect(provider2.getValidAccessToken(tokens.access_token)).toBeUndefined()
+    await expect(provider2.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("different HTTP_AUTH_TOKEN"))
+
+    // The stale grants are wiped from disk too, not just ignored in memory,
+    // and the file now carries the new token's fingerprint.
+    const raw = fs.readFileSync(stateFile, "utf-8")
+    expect(raw).not.toContain(tokens.access_token)
+    expect(raw).not.toContain(tokens.refresh_token!)
+    expect(raw).not.toContain(client.client_id)
+
+    // Rotating back must not resurrect anything either.
+    const provider3 = newProvider({ stateFile })
+    expect(provider3.clientsStore.getClient(client.client_id)).toBeUndefined()
+  })
+
+  it("discards a state file with no fingerprint (pre-fingerprint format)", () => {
+    const now = Math.floor(Date.now() / 1000)
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        clients: [
+          ["legacy-client", { client_id: "legacy-client", redirect_uris: ["http://x/cb"] }],
+        ],
+        accessTokens: [
+          [
+            "legacy-at",
+            { token: "legacy-at", clientId: "legacy-client", scopes: [], expiresAt: now + 3600 },
+          ],
+        ],
+        refreshTokens: [
+          ["legacy-rt", { clientId: "legacy-client", scopes: [], expiresAt: now + 3600 }],
+        ],
+      }),
+    )
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const provider = newProvider({ stateFile })
+    expect(provider.clientsStore.getClient("legacy-client")).toBeUndefined()
+    expect(provider.getValidAccessToken("legacy-at")).toBeUndefined()
+  })
+
+  it("deletes a stale state file when it can't be rewritten", () => {
+    const provider1 = newProvider({ stateFile })
+    void provider1.clientsStore.registerClient!(clientMetadata("old"))
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+    newProvider({ authToken: "rotated-secret", stateFile })
+    write.mockRestore()
+    expect(fs.existsSync(stateFile)).toBe(false)
+  })
+
+  it("refuses to start when a stale state file can be neither rewritten nor deleted", () => {
+    const provider1 = newProvider({ stateFile })
+    void provider1.clientsStore.registerClient!(clientMetadata("old"))
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+    const unlink = vi.spyOn(fs, "unlinkSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+    expect(() => newProvider({ authToken: "rotated-secret", stateFile })).toThrow(
+      /Refusing to start/,
+    )
+    write.mockRestore()
+    unlink.mockRestore()
+    expect(fs.existsSync(stateFile)).toBe(true)
+  })
+})
+
+describe("StaticTokenOAuthProvider refresh token TTL", () => {
+  let stateFile: string
+
+  beforeEach(() => {
+    stateFile = path.join(
+      os.tmpdir(),
+      `riffado-mcp-oauth-refresh-ttl-test-${randomBytes(8).toString("hex")}.json`,
+    )
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    fs.rmSync(stateFile, { force: true })
+  })
+
+  it("stores an expiresAt 90 days out by default", async () => {
+    const provider = newProvider({ stateFile })
+    const before = Math.floor(Date.now() / 1000)
+    const { tokens } = await issueTokens(provider)
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf-8"))
+    const [, stored] = state.refreshTokens.find(([t]: [string]) => t === tokens.refresh_token)
+    expect(stored.expiresAt).toBeGreaterThanOrEqual(before + 90 * 24 * 60 * 60)
+    expect(stored.expiresAt).toBeLessThanOrEqual(before + 90 * 24 * 60 * 60 + 5)
+  })
+
+  it("accepts a refresh token inside its TTL and rejects it once expired", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    const provider = newProvider()
+    const first = await issueTokens(provider)
+    const second = await issueTokens(provider)
+
+    vi.setSystemTime(Date.now() + 89 * DAY)
+    await expect(
+      provider.exchangeRefreshToken(first.client, first.tokens.refresh_token!),
+    ).resolves.toHaveProperty("access_token")
+
+    vi.setSystemTime(Date.now() + 2 * DAY)
+    await expect(
+      provider.exchangeRefreshToken(second.client, second.tokens.refresh_token!),
+    ).rejects.toThrow(/expired/)
+  })
+
+  it("rejects a refresh token at the exact second it expires", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    vi.setSystemTime(Math.floor(Date.now() / 1000) * 1000)
+    const provider = newProvider({ refreshTokenTtlSeconds: 60 })
+    const { client, tokens } = await issueTokens(provider)
+    vi.setSystemTime(Date.now() + 60_000)
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /expired/,
+    )
+  })
+
+  it("honours a custom refreshTokenTtlSeconds", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    const provider = newProvider({ refreshTokenTtlSeconds: 60 })
+    const { client, tokens } = await issueTokens(provider)
+    vi.setSystemTime(Date.now() + 61_000)
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /expired/,
+    )
+  })
+
+  it("drops expired refresh tokens when loading the state file", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    const provider1 = newProvider({ stateFile, refreshTokenTtlSeconds: 60 })
+    const { client, tokens } = await issueTokens(provider1)
+
+    vi.setSystemTime(Date.now() + 120_000)
+    const provider2 = newProvider({ stateFile })
+    await expect(provider2.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /Invalid refresh token/,
+    )
+  })
+
+  it("prunes expired access and refresh tokens from the file on the next write", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    const provider = newProvider({
+      stateFile,
+      accessTokenTtlSeconds: 60,
+      refreshTokenTtlSeconds: 60,
+    })
+    const { tokens } = await issueTokens(provider)
+    expect(fs.readFileSync(stateFile, "utf-8")).toContain(tokens.access_token)
+
+    vi.setSystemTime(Date.now() + 120_000)
+    provider.clientsStore.registerClient!(clientMetadata("trigger-a-write"))
+
+    const raw = fs.readFileSync(stateFile, "utf-8")
+    expect(raw).not.toContain(tokens.access_token)
+    expect(raw).not.toContain(tokens.refresh_token!)
+  })
+})
+
+describe("StaticTokenOAuthProvider authorize() token source", () => {
+  const params = {
+    redirectUri: "http://localhost/callback",
+    codeChallenge: "challenge",
+    scopes: [],
+  }
+
+  it("ignores a correct token passed in the query string and shows the login page", async () => {
+    const provider = newProvider()
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method: "GET", query: { mcp_auth_token: TOKEN } })
+    await provider.authorize(client, params, res)
+    expect(out.location).toBeUndefined()
+    expect(out.statusCode).toBe(200)
+    expect(out.body).toContain('name="mcp_auth_token"')
+  })
+
+  it("ignores a token in the body of a non-POST request", async () => {
+    const provider = newProvider()
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method: "GET", body: { mcp_auth_token: TOKEN } })
+    await provider.authorize(client, params, res)
+    expect(out.location).toBeUndefined()
+  })
+
+  it("accepts the token from a POST body", async () => {
+    const provider = newProvider()
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method: "POST", body: { mcp_auth_token: TOKEN } })
+    await provider.authorize(client, params, res)
+    expect(out.statusCode).toBe(302)
+    expect(new URL(out.location!).searchParams.get("code")).toBeTruthy()
+  })
+})
+
+describe("StaticTokenOAuthProvider login page", () => {
+  async function renderFor(redirectUri: string, method = "GET", body?: Record<string, unknown>) {
+    const provider = newProvider({ authorizeEndpoint: "https://mcp.example.com/authorize" })
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method, body })
+    await provider.authorize(client, { redirectUri, codeChallenge: "x", scopes: [] }, res)
+    return out
+  }
+
+  it("shows the redirect target host so the user sees where the code goes", async () => {
+    const out = await renderFor("https://claude.ai/api/mcp/auth_callback")
+    expect(out.body).toContain("will be redirected to <strong>claude.ai</strong>")
+  })
+
+  it("escapes the redirect host", async () => {
+    const out = await renderFor("http://a'b/cb")
+    expect(out.body).toContain("<strong>a&#39;b</strong>")
+    expect(out.body).not.toContain("a'b")
+  })
+
+  it("shows the scheme for custom-scheme redirect URIs", async () => {
+    const out = await renderFor("cursor://anysphere.cursor-retrieval/oauth/callback")
+    expect(out.body).toContain("<strong>cursor://anysphere.cursor-retrieval</strong>")
+  })
+
+  it("sets security headers, with the redirect origin allowed in form-action", async () => {
+    const out = await renderFor("https://claude.ai/api/mcp/auth_callback")
+    const csp = out.headers["content-security-policy"]
+    expect(csp).toContain("default-src 'none'")
+    expect(csp).toContain("style-src 'unsafe-inline'")
+    expect(csp).toContain("frame-ancestors 'none'")
+    expect(csp).toMatch(/form-action 'self' https:\/\/mcp\.example\.com https:\/\/claude\.ai(;|$)/)
+    expect(out.headers["x-frame-options"]).toBe("DENY")
+    expect(out.headers["referrer-policy"]).toBe("no-referrer")
+    expect(out.headers["cache-control"]).toBe("no-store")
+    expect(out.headers["x-content-type-options"]).toBe("nosniff")
+  })
+
+  it("sets the same headers on the wrong-token page and the success redirect", async () => {
+    const wrong = await renderFor("https://claude.ai/cb", "POST", { mcp_auth_token: "nope" })
+    expect(wrong.statusCode).toBe(401)
+    expect(wrong.headers["x-frame-options"]).toBe("DENY")
+    const ok = await renderFor("https://claude.ai/cb", "POST", { mcp_auth_token: TOKEN })
+    expect(ok.statusCode).toBe(302)
+    expect(ok.headers["cache-control"]).toBe("no-store")
+    expect(ok.headers["content-security-policy"]).toContain("https://claude.ai")
+  })
+})
+
+describe("cspSourceFor", () => {
+  it("returns the origin for plain http(s) URLs", () => {
+    expect(cspSourceFor("https://claude.ai/api/cb")).toBe("https://claude.ai")
+    expect(cspSourceFor("http://localhost:6274/cb")).toBe("http://localhost:6274")
+  })
+
+  it("falls back to a scheme source for custom schemes", () => {
+    expect(cspSourceFor("cursor://anysphere.cursor-retrieval/cb")).toBe("cursor:")
+    expect(cspSourceFor("com.example.app:/cb")).toBe("com.example.app:")
+  })
+
+  it("never lets CSP metacharacters from a hostname into the header", () => {
+    expect(cspSourceFor("http://a;script-src*/cb")).toBe("http:")
+    expect(cspSourceFor("http://a,b/cb")).toBe("http:")
+    expect(cspSourceFor("http://a'b/cb")).toBe("http:")
+  })
+
+  it("returns undefined for unparseable input", () => {
+    expect(cspSourceFor("not a url")).toBeUndefined()
   })
 })

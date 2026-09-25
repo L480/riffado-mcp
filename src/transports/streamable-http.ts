@@ -19,7 +19,7 @@ import "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js"
 import { randomUUID, timingSafeEqual } from "crypto"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { RiffadoTransportServer } from "./base.js"
-import { StaticTokenOAuthProvider } from "./oauth-provider.js"
+import { StaleStateFileError, StaticTokenOAuthProvider } from "./oauth-provider.js"
 
 export interface HealthDetails {
   database: { reachable: boolean }
@@ -29,7 +29,9 @@ export interface HealthDetails {
 export interface StreamableHttpServerOptions {
   port?: number
   host?: string
-  authToken?: string
+  /** Shared secret gating every route except `/health`. Required: there is
+   * no unauthenticated mode. */
+  authToken: string
   authHeaderName?: string
   /** Wraps `authToken` in an OAuth 2.1 flow for OAuth-only clients (Claude's
    * custom connectors offer no static-token field). Defaults to `true`. */
@@ -38,7 +40,8 @@ export interface StreamableHttpServerOptions {
   publicUrl?: string
   /** Where the OAuth provider persists clients + tokens across restarts. */
   oauthStateFile?: string
-  /** Express `trust proxy` setting; required behind the Cloudflare Tunnel. */
+  /** Express `trust proxy` setting (default `false`); set it (e.g. `1`)
+   * behind a reverse proxy or the Cloudflare Tunnel. */
   trustProxy?: boolean | number | string
   corsOptions?: cors.CorsOptions
   requestTimeoutMs?: number
@@ -82,6 +85,11 @@ export class StreamableHttpServer implements RiffadoTransportServer {
   private resourceMetadataUrl?: string
 
   constructor(options: StreamableHttpServerOptions) {
+    // Guards untyped callers too: an empty token would otherwise make the
+    // auth middleware compare against "" rather than fail closed.
+    if (typeof options.authToken !== "string" || options.authToken.length === 0) {
+      throw new Error("StreamableHttpServer requires a non-empty authToken")
+    }
     this.options = {
       port: 3000,
       host: "localhost",
@@ -107,13 +115,20 @@ export class StreamableHttpServer implements RiffadoTransportServer {
     // this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
     this.app.set("trust proxy", this.options.trustProxy ?? false)
 
+    this.app.use((_req: Request, res: Response, next: NextFunction) => {
+      res.setHeader("X-Content-Type-Options", "nosniff")
+      next()
+    })
+
     if (this.options.enableRequestLogging) {
+      // `req.path`, never `req.url`: query strings can carry OAuth codes,
+      // state and other secrets that don't belong in logs.
       this.app.use((req: Request, res: Response, next: NextFunction) => {
         const start = Date.now()
-        console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - ${req.ip}`)
+        console.error(`[${new Date().toISOString()}] ${req.method} ${req.path} - ${req.ip}`)
         res.on("finish", () => {
           console.error(
-            `[${new Date().toISOString()}] ${req.method} ${req.url} - ${res.statusCode} - ${Date.now() - start}ms`,
+            `[${new Date().toISOString()}] ${req.method} ${req.path} - ${res.statusCode} - ${Date.now() - start}ms`,
           )
         })
         next()
@@ -157,56 +172,57 @@ export class StreamableHttpServer implements RiffadoTransportServer {
       }),
     )
 
+    // Baseline hardening for everything under /authorize, including the
+    // SDK's own error responses. The provider's authorize() replaces the CSP
+    // with one that also allows the login form post and client redirect.
+    this.app.use("/authorize", (_req: Request, res: Response, next: NextFunction) => {
+      res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+      res.setHeader("X-Frame-Options", "DENY")
+      res.setHeader("Referrer-Policy", "no-referrer")
+      res.setHeader("Cache-Control", "no-store")
+      next()
+    })
+
     this.setupOAuth()
 
-    if (this.options.authToken) {
-      this.app.use((req: Request, res: Response, next: NextFunction) => {
-        if (req.path === "/health") {
+    this.app.use((req: Request, res: Response, next: NextFunction) => {
+      if (req.path === "/health") {
+        return next()
+      }
+
+      const headerName = this.options.authHeaderName ?? "x-mcp-token"
+      const headerToken = req.header(headerName)
+      const authorizationHeader = req.header("authorization")
+      const bearerToken =
+        typeof authorizationHeader === "string" && authorizationHeader.startsWith("Bearer ")
+          ? authorizationHeader.slice(7)
+          : undefined
+
+      const staticTokenValid =
+        this.compareAuthTokens(headerToken) ||
+        (bearerToken !== undefined && this.compareAuthTokens(bearerToken))
+      if (staticTokenValid) {
+        return next()
+      }
+
+      if (this.oauthProvider && bearerToken !== undefined) {
+        const authInfo = this.oauthProvider.getValidAccessToken(bearerToken)
+        if (authInfo) {
+          req.auth = authInfo
           return next()
         }
+      }
 
-        const headerName = this.options.authHeaderName ?? "x-mcp-token"
-        const headerToken = req.header(headerName)
-        const authorizationHeader = req.header("authorization")
-        const bearerToken =
-          typeof authorizationHeader === "string" && authorizationHeader.startsWith("Bearer ")
-            ? authorizationHeader.slice(7)
-            : undefined
+      // RFC 9728: point compatible clients at OAuth discovery.
+      if (this.resourceMetadataUrl) {
+        res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${this.resourceMetadataUrl}"`)
+      }
 
-        const staticTokenValid =
-          this.compareAuthTokens(headerToken) ||
-          (bearerToken !== undefined && this.compareAuthTokens(bearerToken))
-        if (staticTokenValid) {
-          return next()
-        }
-
-        if (this.oauthProvider && bearerToken !== undefined) {
-          const authInfo = this.oauthProvider.getValidAccessToken(bearerToken)
-          if (authInfo) {
-            req.auth = authInfo
-            return next()
-          }
-        }
-
-        // RFC 9728: point compatible clients at OAuth discovery.
-        if (this.resourceMetadataUrl) {
-          res.setHeader(
-            "WWW-Authenticate",
-            `Bearer resource_metadata="${this.resourceMetadataUrl}"`,
-          )
-        }
-
-        return res.status(401).json({
-          error: "Unauthorized",
-          message: "Missing or invalid authentication token. Provide a valid auth header.",
-        })
+      return res.status(401).json({
+        error: "Unauthorized",
+        message: "Missing or invalid authentication token. Provide a valid auth header.",
       })
-    } else {
-      console.error(
-        "WARNING: HTTP_AUTH_TOKEN is not set — the HTTP transport is running UNAUTHENTICATED. " +
-          "Set HTTP_AUTH_TOKEN before exposing this server.",
-      )
-    }
+    })
 
     this.app.use((_req: Request, res: Response, next: NextFunction) => {
       const timeout = setTimeout(() => {
@@ -243,7 +259,7 @@ export class StreamableHttpServer implements RiffadoTransportServer {
   }
 
   private compareAuthTokens(token: string | undefined): boolean {
-    if (!this.options.authToken || typeof token !== "string") {
+    if (typeof token !== "string") {
       return false
     }
     const provided = Buffer.from(token)
@@ -263,12 +279,12 @@ export class StreamableHttpServer implements RiffadoTransportServer {
 
   /**
    * Mounts the OAuth 2.1 authorization server wrapping the shared token.
-   * Skipped when there's no shared token or OAuth is disabled. If a valid
-   * issuer URL can't be formed, OAuth is disabled with an actionable log
-   * message while shared-token auth keeps working.
+   * Skipped when OAuth is disabled. If a valid issuer URL can't be formed,
+   * OAuth is disabled with an actionable log message while shared-token
+   * auth keeps working.
    */
   private setupOAuth(): void {
-    if (!this.options.authToken || this.options.oauthEnabled === false) {
+    if (this.options.oauthEnabled === false) {
       return
     }
 
@@ -310,6 +326,11 @@ export class StreamableHttpServer implements RiffadoTransportServer {
       this.resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceServerUrl)
       console.error(`OAuth authorization server enabled (issuer: ${issuerUrl.href})`)
     } catch (error) {
+      // An unverifiable state file is not a config problem to degrade
+      // around: starting anyway would leave it on disk to be trusted later.
+      if (error instanceof StaleStateFileError) {
+        throw error
+      }
       const message = error instanceof Error ? error.message : String(error)
       console.error(
         `OAuth authorization server disabled: ${message}. Set HTTP_PUBLIC_URL to a public HTTPS URL ` +
@@ -333,7 +354,10 @@ export class StreamableHttpServer implements RiffadoTransportServer {
             jsonrpc: "2.0",
             error: {
               code: -32000,
-              message: error instanceof Error ? error.message : "Internal error",
+              // Only SessionError messages are written for clients; anything
+              // else may carry internals (SQL, paths, stack-ish detail) and is
+              // logged above instead.
+              message: error instanceof SessionError ? error.message : "Internal error",
             },
             id: null,
           })
@@ -364,11 +388,8 @@ export class StreamableHttpServer implements RiffadoTransportServer {
         const details = await this.options.healthCheck()
         res.status(200).json({ ...base, ...details })
       } catch (error) {
-        res.status(200).json({
-          ...base,
-          status: "degraded",
-          error: error instanceof Error ? error.message : String(error),
-        })
+        console.error("Health check failed:", error)
+        res.status(200).json({ ...base, status: "degraded", error: "Health check failed" })
       }
     })
   }

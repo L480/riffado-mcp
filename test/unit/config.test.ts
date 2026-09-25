@@ -38,8 +38,8 @@ describe("loadConfig", () => {
   })
 
   describe("HTTP_TRUST_PROXY coercion", () => {
-    it("defaults to 1", () => {
-      expect(loadConfig(BASE_ENV).HTTP_TRUST_PROXY).toBe(1)
+    it("defaults to false (X-Forwarded-For not trusted unless configured)", () => {
+      expect(loadConfig(BASE_ENV).HTTP_TRUST_PROXY).toBe(false)
     })
 
     it("coerces 'true'/'false'", () => {
@@ -49,6 +49,14 @@ describe("loadConfig", () => {
 
     it("coerces a numeric string to a number", () => {
       expect(loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "2" }).HTTP_TRUST_PROXY).toBe(2)
+    })
+
+    it("rejects an oversized hop count instead of trusting every hop", () => {
+      expect(loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "10" }).HTTP_TRUST_PROXY).toBe(10)
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "11" })).toThrow(/hop count/)
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "9".repeat(400) })).toThrow(
+        /hop count/,
+      )
     })
 
     it("passes through a subnet/preset string unchanged", () => {
@@ -71,10 +79,29 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...BASE_ENV, TRANSPORT: "carrier-pigeon" })).toThrow()
   })
 
-  describe("HTTP_AUTH_TOKEN minimum length", () => {
-    it("leaves it unset when absent (unauthenticated HTTP transport stays a valid config)", () => {
+  describe("HTTP_AUTH_TOKEN", () => {
+    it("is optional for the stdio transport", () => {
       const config = loadConfig(BASE_ENV)
       expect(config.HTTP_AUTH_TOKEN).toBeUndefined()
+    })
+
+    it("is required for the HTTP transport (no unauthenticated mode)", () => {
+      expect(() => loadConfig({ ...BASE_ENV, TRANSPORT: "http" })).toThrow(
+        /HTTP_AUTH_TOKEN is required when TRANSPORT=http/,
+      )
+    })
+
+    it("accepts the HTTP transport with a valid token", () => {
+      const token = "a".repeat(32)
+      const config = loadConfig({ ...BASE_ENV, TRANSPORT: "http", HTTP_AUTH_TOKEN: token })
+      expect(config.TRANSPORT).toBe("http")
+      expect(config.HTTP_AUTH_TOKEN).toBe(token)
+    })
+
+    it("rejects a short token on the HTTP transport too", () => {
+      expect(() =>
+        loadConfig({ ...BASE_ENV, TRANSPORT: "http", HTTP_AUTH_TOKEN: "a".repeat(31) }),
+      ).toThrow(/at least 32 characters/)
     })
 
     it("rejects a token shorter than 32 characters", () => {
@@ -101,6 +128,59 @@ describe("loadConfig", () => {
       expect(
         loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "0" }).HTTP_SESSION_TIMEOUT_MS,
       ).toBe(0)
+    })
+  })
+
+  describe("numeric env vars", () => {
+    it("parses valid integers (surrounding whitespace tolerated)", () => {
+      const config = loadConfig({
+        ...BASE_ENV,
+        HTTP_PORT: " 8080 ",
+        HTTP_SESSION_TIMEOUT_MS: "1000",
+        CACHE_TTL_MS: "5000",
+        DB_STATEMENT_TIMEOUT_MS: "2500",
+      })
+      expect(config.HTTP_PORT).toBe(8080)
+      expect(config.HTTP_SESSION_TIMEOUT_MS).toBe(1000)
+      expect(config.CACHE_TTL_MS).toBe(5000)
+      expect(config.DB_STATEMENT_TIMEOUT_MS).toBe(2500)
+    })
+
+    it.each(["", "abc", "3000abc", "1.5", "-1", "1e3", "0x10"])(
+      "rejects HTTP_PORT=%j instead of silently parseInt-ing it",
+      (value) => {
+        expect(() => loadConfig({ ...BASE_ENV, HTTP_PORT: value })).toThrow(/HTTP_PORT/)
+      },
+    )
+
+    it("bounds HTTP_PORT to 1-65535", () => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_PORT: "0" })).toThrow(/HTTP_PORT/)
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_PORT: "65536" })).toThrow(/HTTP_PORT/)
+      expect(loadConfig({ ...BASE_ENV, HTTP_PORT: "1" }).HTTP_PORT).toBe(1)
+      expect(loadConfig({ ...BASE_ENV, HTTP_PORT: "65535" }).HTTP_PORT).toBe(65535)
+    })
+
+    it("requires CACHE_TTL_MS and DB_STATEMENT_TIMEOUT_MS to be positive", () => {
+      expect(() => loadConfig({ ...BASE_ENV, CACHE_TTL_MS: "0" })).toThrow(/CACHE_TTL_MS/)
+      expect(() => loadConfig({ ...BASE_ENV, DB_STATEMENT_TIMEOUT_MS: "0" })).toThrow(
+        /DB_STATEMENT_TIMEOUT_MS/,
+      )
+      expect(() => loadConfig({ ...BASE_ENV, CACHE_TTL_MS: "-5" })).toThrow(/CACHE_TTL_MS/)
+    })
+
+    it("rejects timeouts above the 2^31-1 ms setTimeout limit", () => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "2147483648" })).toThrow(
+        /HTTP_SESSION_TIMEOUT_MS/,
+      )
+      expect(
+        loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "2147483647" }).HTTP_SESSION_TIMEOUT_MS,
+      ).toBe(2147483647)
+    })
+
+    it("rejects a non-integer HTTP_SESSION_TIMEOUT_MS", () => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_SESSION_TIMEOUT_MS: "1h" })).toThrow(
+        /HTTP_SESSION_TIMEOUT_MS/,
+      )
     })
   })
 })
