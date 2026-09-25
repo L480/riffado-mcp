@@ -209,6 +209,24 @@ Harness + reproduction steps: [`bench/README.md`](./bench/README.md).
 - **Read-only, enforced by Postgres**: the pool's session starts with
   `default_transaction_read_only=on` — a bug or prompt injection in a tool
   handler cannot mutate Riffado, because Postgres itself rejects the write.
+- **Use a dedicated read-only role anyway** (defence in depth: a session
+  can `SET default_transaction_read_only=off`, a role without write grants
+  can't write regardless). The server only reads `recordings`,
+  `transcriptions` and `ai_enhancements`:
+
+  ```sql
+  CREATE ROLE riffado_mcp LOGIN PASSWORD '...';
+  GRANT CONNECT ON DATABASE riffado TO riffado_mcp;
+  GRANT USAGE ON SCHEMA public TO riffado_mcp;
+  GRANT SELECT ON recordings, transcriptions, ai_enhancements TO riffado_mcp;
+  ```
+
+  then `DATABASE_URL=postgresql://riffado_mcp:...@riffado-db:5432/riffado`.
+
+- **Encrypt the DB connection off-host**: when Postgres is not on the same
+  host or Docker network, add `?sslmode=require` to `DATABASE_URL` (or
+  `verify-full` with the server's CA), otherwise ciphertext _and_ the
+  credentials cross the network in the clear.
 - **No plaintext at rest, ever**: recordings are decrypted in memory on
   each cache refresh (default TTL 60s) and never written to disk.
 - **No audio, no storage paths, no credentials, no other users' rows** are

@@ -44,7 +44,10 @@ That makes the deployment, not just the code, part of the security surface:
   `default_transaction_read_only=on`, so the database itself rejects any
   mutation — including one coming from prompt injection in a transcript. This
   is a deliberate defence-in-depth boundary; do not remove it to "add a
-  feature".
+  feature". Connect with a dedicated `SELECT`-only role as a second
+  layer (example in the README), and use `sslmode=require` in `DATABASE_URL`
+  whenever the database is reached over a network rather than the same
+  host/Docker network.
 - **Prompt injection is in scope for confidentiality, not integrity.** A
   recording's transcript is untrusted text that an LLM will read. It cannot
   change Riffado's data, but it can try to influence the client. Nothing in

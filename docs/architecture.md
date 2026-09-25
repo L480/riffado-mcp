@@ -125,7 +125,10 @@ The pg pool starts every session with `-c default_transaction_read_only=on`.
 Postgres itself then rejects any `INSERT`/`UPDATE`/`DELETE` — the guarantee
 lives at the database layer, not in application code, so a bug or a prompt
 injection in a tool handler cannot mutate Riffado no matter what SQL it
-tries to build (all queries are parameterized `SELECT`s regardless).
+tries to build (all queries are parameterized `SELECT`s regardless). A
+dedicated role with only `SELECT` grants (see README) is recommended on top:
+a session-level default can in principle be overridden within the session,
+a missing grant cannot.
 
 ## OAuth wraps a static token
 
