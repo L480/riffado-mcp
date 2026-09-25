@@ -562,7 +562,10 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
           this.clients.has(g.clientId) &&
           isStringArray(g.scopes) &&
           typeof g.expiresAt === "number" &&
-          g.expiresAt > now
+          g.expiresAt > now &&
+          // getValidAccessToken turns this into a URL; a malformed value
+          // would make every request with the token throw.
+          (g.resource === undefined || (typeof g.resource === "string" && URL.canParse(g.resource)))
         )
       }
       for (const [hash, accessToken] of parsed.accessTokens ?? []) {
@@ -634,6 +637,14 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * already there) and `renameSync`-ing it over the target, which is
    * atomic on the same filesystem.
    */
+  /**
+   * Set when a write failed, so the file may hold grants that are already
+   * revoked in memory. Cleared by the next successful write; while set,
+   * a retried revocation writes again even if the token is already gone
+   * from memory.
+   */
+  private stateFileStale = false
+
   private persistState(): boolean {
     // Pruned even without a state file, so expired tokens never accumulate
     // in memory either.
@@ -659,6 +670,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     try {
       fs.writeFileSync(tmpFile, JSON.stringify(state), { mode: 0o600 })
       fs.renameSync(tmpFile, this.stateFile)
+      this.stateFileStale = false
       return true
     } catch (error) {
       try {
@@ -668,6 +680,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       }
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Failed to persist OAuth state to ${this.stateFile}: ${message}`)
+      this.stateFileStale = true
       return false
     }
   }
@@ -1074,10 +1087,13 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       revoked = true
     }
     // Unknown or foreign tokens are a successful no-op (RFC 7009), with no
-    // write attempted. An actual revocation holds in memory either way, but
-    // if it can't be written the token would come back after a restart:
-    // report that instead of a false success.
-    if (revoked && !this.persistState()) {
+    // write attempted -- unless an earlier write failed: then a retry of a
+    // revocation (whose token is already gone from memory) must still get
+    // the file rewritten. A revocation stays in effect in memory either way
+    // (rolling it back would re-enable a token the client asked to kill),
+    // but if it can't be written it would come back after a restart, so
+    // that's reported instead of a false success.
+    if ((revoked || this.stateFileStale) && !this.persistState()) {
       throw new ServerError("Token revoked in memory but could not be persisted; retry")
     }
   }

@@ -804,6 +804,46 @@ describe("StaticTokenOAuthProvider token storage and lifetimes", () => {
     expect(provider.getValidAccessToken(tokens.access_token)).toBeUndefined()
   })
 
+  it("a retried revocation after a failed write is persisted, so a restart can't revive the token", async () => {
+    const provider = newProvider({ stateFile })
+    const { client, tokens } = await issueTokens(provider)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+    await expect(provider.revokeToken(client, { token: tokens.refresh_token! })).rejects.toThrow(
+      /could not be persisted/,
+    )
+    // Still failing: the retry must keep reporting it, not claim a no-op success.
+    await expect(provider.revokeToken(client, { token: tokens.refresh_token! })).rejects.toThrow(
+      /could not be persisted/,
+    )
+    write.mockRestore()
+
+    // Storage recovered: the retry succeeds and actually rewrites the file.
+    await expect(
+      provider.revokeToken(client, { token: tokens.refresh_token! }),
+    ).resolves.toBeUndefined()
+    const restarted = newProvider({ stateFile })
+    expect(restarted.getValidAccessToken(tokens.access_token)).toBeUndefined()
+    await expect(restarted.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /Invalid refresh token/,
+    )
+  })
+
+  it("drops persisted access tokens whose resource isn't a valid URL", async () => {
+    const provider = newProvider({ stateFile })
+    const { tokens } = await issueTokens(provider)
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf-8"))
+    state.accessTokens[0][1].resource = "not a url"
+    fs.writeFileSync(stateFile, JSON.stringify(state))
+    vi.spyOn(console, "error").mockImplementation(() => {})
+
+    const restarted = newProvider({ stateFile })
+    expect(() => restarted.getValidAccessToken(tokens.access_token)).not.toThrow()
+    expect(restarted.getValidAccessToken(tokens.access_token)).toBeUndefined()
+  })
+
   it("treats revoking an unknown or foreign token as a no-op without touching the file", async () => {
     const provider = newProvider({ stateFile })
     const { tokens } = await issueTokens(provider)
