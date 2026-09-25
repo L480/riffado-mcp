@@ -138,6 +138,17 @@ login page, and in exchange receives a normal OAuth access token used as
 itself (as a raw bearer or the `x-mcp-token` header) still works directly,
 for stdio-adjacent or scripted use.
 
+Clients and tokens are persisted to `HTTP_OAUTH_STATE_FILE` so the
+connector survives restarts. The file also carries an HMAC-SHA256
+fingerprint of the shared token (keyed by the token, never the token
+itself); if it is missing or doesn't match the current `HTTP_AUTH_TOKEN`,
+everything in the file is discarded on load. Every OAuth grant descends from
+someone knowing the shared token, so rotating that token has to revoke them
+all — otherwise a leaked refresh token would outlive the secret it was
+obtained with. Access tokens expire after 30 days, refresh tokens after 90
+(each refresh rotates the refresh token and restarts that clock); expired
+ones are dropped on load, on refresh, and on every state write.
+
 ## Don't put an identity-aware proxy in front
 
 If you expose this through Cloudflare Tunnel or an equivalent, do it **without**

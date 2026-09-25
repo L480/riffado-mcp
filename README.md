@@ -136,6 +136,10 @@ npm run build
 3. Claude opens the login page; paste the `HTTP_AUTH_TOKEN` value. Claude
    then holds a normal OAuth bearer token — the connector survives process
    restarts because OAuth state is persisted to `HTTP_OAUTH_STATE_FILE`.
+   Rotating `HTTP_AUTH_TOKEN` revokes every issued OAuth token and
+   registered client on the next start; connectors then log in again with
+   the new value. A connector left idle for more than 90 days (refresh
+   token lifetime) also has to log in again.
 
 ## Docker Compose example
 

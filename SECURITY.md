@@ -53,6 +53,14 @@ That makes the deployment, not just the code, part of the security surface:
 - **OAuth state at rest.** `HTTP_OAUTH_STATE_FILE` holds issued access and
   refresh tokens in plaintext JSON. The server writes it atomically at
   `0600`; keep it on a volume only the container user can read regardless.
+  Expired tokens are pruned on every write. Access tokens live 30 days,
+  refresh tokens 90 days (each refresh rotates the refresh token and restarts
+  its lifetime).
+- **Rotating `HTTP_AUTH_TOKEN` revokes every OAuth grant.** The state file
+  stores an HMAC-SHA256 fingerprint of the token (never the token itself);
+  on startup, state issued under a different token is discarded and the file
+  rewritten, so every connector has to log in again with the new secret. This
+  is the way to cut off a leaked access or refresh token.
 - **OAuth client registration (`/register`) is unauthenticated by spec** —
   Claude's dynamic client registration has to be. The registry is capped
   (default 100 clients, oldest evicted first) so an anonymous caller can't
