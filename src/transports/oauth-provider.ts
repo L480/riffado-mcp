@@ -912,7 +912,11 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     }
 
     if (stored.expiresAt <= Math.floor(Date.now() / 1000)) {
-      this.revokeRefreshToken(hash)
+      // Only the expired refresh token is dropped, not its paired access
+      // token (that one expires on its own). Nothing is revoked here, so a
+      // failed write can't resurrect anything: the refresh token is expired
+      // on disk too and is dropped again on load.
+      this.refreshTokens.delete(hash)
       this.persistState()
       throw new InvalidGrantError("Refresh token has expired")
     }
@@ -1060,16 +1064,20 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       throw new ServerError("Missing token to revoke")
     }
     const hash = hashToken(request.token)
+    let revoked = false
     if (this.accessTokens.get(hash)?.clientId === client.client_id) {
       this.accessTokens.delete(hash)
+      revoked = true
     }
     if (this.refreshTokens.get(hash)?.clientId === client.client_id) {
       this.revokeRefreshToken(hash)
+      revoked = true
     }
-    // The revocation holds in memory either way, but if it can't be written
-    // the token would come back after a restart: report that instead of a
-    // false success.
-    if (!this.persistState()) {
+    // Unknown or foreign tokens are a successful no-op (RFC 7009), with no
+    // write attempted. An actual revocation holds in memory either way, but
+    // if it can't be written the token would come back after a restart:
+    // report that instead of a false success.
+    if (revoked && !this.persistState()) {
       throw new ServerError("Token revoked in memory but could not be persisted; retry")
     }
   }

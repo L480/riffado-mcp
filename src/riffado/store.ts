@@ -43,6 +43,26 @@ export interface RecordingStoreOptions {
   transcriptCacheSize?: number
 }
 
+/**
+ * A log-safe description of a decrypt/parse failure. Raw `err.message` is
+ * not safe: `JSON.parse` quotes a snippet of its input, which here is
+ * decrypted recording content. Only messages known to be content-free
+ * (our own ciphertext-shape errors, Node's GCM authentication failure) are
+ * passed through; anything else is reduced to its error class.
+ */
+export function safeErrorLabel(err: unknown): string {
+  if (err instanceof SyntaxError) {
+    return "invalid JSON (SyntaxError)"
+  }
+  if (
+    err instanceof Error &&
+    /^(invalid v1 ciphertext: |Unsupported state or unable to authenticate data$)/.test(err.message)
+  ) {
+    return err.message
+  }
+  return err instanceof Error ? err.name : "unknown error"
+}
+
 interface MetaRow {
   id: string
   user_id: string
@@ -249,12 +269,11 @@ export class RecordingStore {
         } catch (err) {
           // Same reasoning as buildRecording(): one undecryptable transcript
           // row (bad GCM tag) must not fail the whole batch. Log only the
-          // recording id/source + error message, and yield no text for
-          // that source instead of throwing.
-          const message = err instanceof Error ? err.message : String(err)
+          // recording id/source + a content-free error label, and yield no
+          // text for that source instead of throwing.
           console.error(
             `[riffado-mcp] skipping transcript for recording ${row.recording_id} ` +
-              `(source ${row.source}): ${message}`,
+              `(source ${row.source}): ${safeErrorLabel(err)}`,
           )
         }
         byId.set(row.recording_id, texts)
@@ -357,11 +376,10 @@ export class RecordingStore {
         } catch (err) {
           // A bad GCM tag (decipher.final() throws) or invalid JSON in
           // key_points/action_items for one recording must not break the
-          // whole refresh. Log only the id + error message -- never the
+          // whole refresh. Log only the id + a content-free label -- never the
           // plaintext/ciphertext -- and skip that recording; it simply
           // won't appear in this refresh (same as a deleted/trashed one).
-          const message = err instanceof Error ? err.message : String(err)
-          console.error(`[riffado-mcp] skipping recording ${id}: ${message}`)
+          console.error(`[riffado-mcp] skipping recording ${id}: ${safeErrorLabel(err)}`)
         }
       }
     }

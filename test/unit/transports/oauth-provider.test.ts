@@ -804,6 +804,44 @@ describe("StaticTokenOAuthProvider token storage and lifetimes", () => {
     expect(provider.getValidAccessToken(tokens.access_token)).toBeUndefined()
   })
 
+  it("treats revoking an unknown or foreign token as a no-op without touching the file", async () => {
+    const provider = newProvider({ stateFile })
+    const { tokens } = await issueTokens(provider)
+    const other = provider.clientsStore.registerClient!(
+      clientMetadata("other"),
+    ) as OAuthClientInformationFull
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+
+    await expect(provider.revokeToken(other, { token: "never-issued" })).resolves.toBeUndefined()
+    await expect(
+      provider.revokeToken(other, { token: tokens.refresh_token! }),
+    ).resolves.toBeUndefined()
+    expect(write).not.toHaveBeenCalled()
+    expect(provider.getValidAccessToken(tokens.access_token)).toBeDefined()
+  })
+
+  it("an expired refresh token doesn't revoke its paired access token", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    // Access outliving refresh is a misconfiguration, but it's the only way
+    // the pair's access token can still be live when the refresh expires.
+    const provider = newProvider({
+      stateFile,
+      accessTokenTtlSeconds: 3600,
+      refreshTokenTtlSeconds: 60,
+    })
+    const { client, tokens } = await issueTokens(provider)
+    vi.setSystemTime(Date.now() + 120_000)
+
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /expired/,
+    )
+    // Memory and disk agree after a restart: no revocation happened.
+    expect(provider.getValidAccessToken(tokens.access_token)).toBeDefined()
+    expect(newProvider({ stateFile }).getValidAccessToken(tokens.access_token)).toBeDefined()
+  })
+
   it("persists tokens only as SHA-256 hashes, in a versioned format", async () => {
     const provider = newProvider({ stateFile })
     const { tokens } = await issueTokens(provider)

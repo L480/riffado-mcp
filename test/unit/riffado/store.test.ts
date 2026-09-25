@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { IV_STAMP_PREFIX_LEN, JSON_IV_STAMP_PREFIX_LEN } from "../../../src/riffado/crypto.js"
-import { RecordingStore } from "../../../src/riffado/store.js"
+import { RecordingStore, safeErrorLabel } from "../../../src/riffado/store.js"
 import { encryptForTest, TEST_ENCRYPTION_KEY } from "../../integration/seed.js"
 
 const KEY = Buffer.from(TEST_ENCRYPTION_KEY, "hex")
@@ -521,11 +521,32 @@ describe("RecordingStore per-recording error isolation", () => {
     const recordings = await store.get()
 
     expect(recordings.map((r) => r.id)).toEqual(["rec-good"])
-    expect(
-      errorSpy.mock.calls.some((c) => String(c[0]).includes("skipping recording rec-bad-json")),
-    ).toBe(true)
+    const skipLine = errorSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((line) => line.includes("skipping recording rec-bad-json"))
+    expect(skipLine).toBeDefined()
+    // JSON.parse quotes its input in the error message; that input is
+    // decrypted content and must not reach the log.
+    expect(skipLine).toContain("invalid JSON")
+    expect(skipLine).not.toContain("not valid json")
 
     errorSpy.mockRestore()
+  })
+})
+
+describe("safeErrorLabel", () => {
+  it("passes through only content-free messages", () => {
+    expect(safeErrorLabel(new SyntaxError('Unexpected token, "secret" is not valid JSON'))).toBe(
+      "invalid JSON (SyntaxError)",
+    )
+    expect(safeErrorLabel(new Error("invalid v1 ciphertext: IV must be 24 hex chars, got 2"))).toBe(
+      "invalid v1 ciphertext: IV must be 24 hex chars, got 2",
+    )
+    expect(safeErrorLabel(new Error("Unsupported state or unable to authenticate data"))).toBe(
+      "Unsupported state or unable to authenticate data",
+    )
+    expect(safeErrorLabel(new TypeError("something with secret content"))).toBe("TypeError")
+    expect(safeErrorLabel("secret")).toBe("unknown error")
   })
 })
 
