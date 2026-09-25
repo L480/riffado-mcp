@@ -57,13 +57,29 @@ const intFromEnv = (name: string, defaultValue: string, min: number, max: number
 // X-Forwarded-For when no proxy is actually in front lets any client spoof
 // its IP and dodge the per-IP rate limits. Set it (e.g. `1`) explicitly
 // when running behind a reverse proxy or Cloudflare Tunnel.
+// More proxy hops than any real deployment chains (CDN -> LB -> ingress).
+const MAX_PROXY_HOPS = 10
+
 const trustProxyCoercion = z
   .string()
   .default("false")
-  .transform((val): boolean | number | string => {
+  .transform((val, ctx): boolean | number | string => {
     if (val === "true") return true
     if (val === "false" || val === "") return false
-    if (/^\d+$/.test(val)) return parseInt(val, 10)
+    if (/^\d+$/.test(val)) {
+      // A hop count, not a subnet/preset. Bounded: an oversized value (or
+      // one parseInt rounds to Infinity) would trust every X-Forwarded-For
+      // hop, letting clients spoof their IP past the rate limits.
+      const hops = Number(val)
+      if (hops > MAX_PROXY_HOPS) {
+        ctx.addIssue({
+          code: "custom",
+          message: `HTTP_TRUST_PROXY hop count must be between 0 and ${MAX_PROXY_HOPS}, got "${val}"`,
+        })
+        return z.NEVER
+      }
+      return hops
+    }
     return val
   })
 

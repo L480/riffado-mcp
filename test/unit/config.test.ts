@@ -51,6 +51,14 @@ describe("loadConfig", () => {
       expect(loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "2" }).HTTP_TRUST_PROXY).toBe(2)
     })
 
+    it("rejects an oversized hop count instead of trusting every hop", () => {
+      expect(loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "10" }).HTTP_TRUST_PROXY).toBe(10)
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "11" })).toThrow(/hop count/)
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "9".repeat(400) })).toThrow(
+        /hop count/,
+      )
+    })
+
     it("passes through a subnet/preset string unchanged", () => {
       expect(loadConfig({ ...BASE_ENV, HTTP_TRUST_PROXY: "loopback" }).HTTP_TRUST_PROXY).toBe(
         "loopback",
