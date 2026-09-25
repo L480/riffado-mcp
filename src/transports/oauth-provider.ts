@@ -92,8 +92,12 @@ interface StoredRefreshToken {
   expiresAt: number
 }
 
-/** Thrown when a state file from a previous auth token can't be removed. */
-class StaleStateFileError extends Error {}
+/**
+ * Thrown when the state file exists but can't be verified or cleared: it
+ * may hold grants issued under a previous auth token, so the server must
+ * not start (a later restart with that token would resurrect them).
+ */
+export class StaleStateFileError extends Error {}
 
 /** Fixed HMAC message: the fingerprint is keyed by the token, so it can't be
  * compared against a plain SHA-256 of the token computed anywhere else. */
@@ -270,8 +274,18 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     let raw: string
     try {
       raw = fs.readFileSync(this.stateFile, "utf-8")
-    } catch {
-      return
+    } catch (error) {
+      // Only a missing file means "no prior state". Any other read error
+      // leaves a file whose fingerprint we can't check on disk, so fail
+      // closed rather than start and let it be trusted on a later restart.
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      throw new StaleStateFileError(
+        `Could not read OAuth state file ${this.stateFile} (${message}). Refusing to start: ` +
+          `its token fingerprint can't be verified. Fix its permissions or delete it.`,
+      )
     }
 
     try {

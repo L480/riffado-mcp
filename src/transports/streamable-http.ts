@@ -19,7 +19,7 @@ import "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js"
 import { randomUUID, timingSafeEqual } from "crypto"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { RiffadoTransportServer } from "./base.js"
-import { StaticTokenOAuthProvider } from "./oauth-provider.js"
+import { StaleStateFileError, StaticTokenOAuthProvider } from "./oauth-provider.js"
 
 export interface HealthDetails {
   database: { reachable: boolean }
@@ -326,6 +326,11 @@ export class StreamableHttpServer implements RiffadoTransportServer {
       this.resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceServerUrl)
       console.error(`OAuth authorization server enabled (issuer: ${issuerUrl.href})`)
     } catch (error) {
+      // An unverifiable state file is not a config problem to degrade
+      // around: starting anyway would leave it on disk to be trusted later.
+      if (error instanceof StaleStateFileError) {
+        throw error
+      }
       const message = error instanceof Error ? error.message : String(error)
       console.error(
         `OAuth authorization server disabled: ${message}. Set HTTP_PUBLIC_URL to a public HTTPS URL ` +

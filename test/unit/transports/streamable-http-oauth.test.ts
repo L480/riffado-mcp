@@ -413,7 +413,7 @@ describe("StreamableHttpServer OAuth state persistence across restarts", () => {
   })
 
   afterEach(() => {
-    fs.rmSync(stateFile, { force: true })
+    fs.rmSync(stateFile, { force: true, recursive: true })
   })
 
   const startServer = async (): Promise<{ server: StreamableHttpServer; port: number }> => {
@@ -505,6 +505,24 @@ describe("StreamableHttpServer OAuth state persistence across restarts", () => {
     } finally {
       await server2.stop()
     }
+  })
+
+  it("refuses to start when the state file exists but can't be read", () => {
+    // A directory at the state path makes readFileSync fail with EISDIR --
+    // a real non-ENOENT read error, even when the tests run as root.
+    fs.mkdirSync(stateFile)
+    expect(
+      () =>
+        new StreamableHttpServer({
+          port: 0,
+          host: "127.0.0.1",
+          authToken: "super-secret-token",
+          publicUrl: "http://localhost",
+          enableRequestLogging: false,
+          oauthStateFile: stateFile,
+          createServer: stubServer,
+        }),
+    ).toThrow(/Refusing to start/)
   })
 
   it("tolerates a corrupt state file instead of failing to start", async () => {
