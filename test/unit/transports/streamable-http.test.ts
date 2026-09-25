@@ -393,4 +393,77 @@ describe("StreamableHttpServer", () => {
       log.mockRestore()
     }
   })
+
+  it("reports a degraded /health/details without leaking the internal error", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      ;({ server } = await startServer({
+        healthCheck: async () => {
+          throw new Error("connect ECONNREFUSED 10.0.0.5:5432 password=hunter2")
+        },
+      }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      const res = await request(port, "/health/details", { headers: AUTH })
+      expect(res.statusCode).toBe(200)
+      const body = JSON.parse(res.body)
+      expect(body.status).toBe("degraded")
+      expect(body.error).toBe("Health check failed")
+      expect(res.body).not.toContain("ECONNREFUSED")
+      expect(res.body).not.toContain("hunter2")
+      // The real error still reaches stderr for the operator.
+      expect(log.mock.calls.flat().some((a) => String(a).includes("ECONNREFUSED"))).toBe(true)
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it("returns a generic message for non-session errors on the MCP route", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      ;({ server } = await startServer({
+        createServer: () => {
+          throw new Error("internal detail: /srv/secret/path")
+        },
+      }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      const res = await request(port, "/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...AUTH,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-03-26",
+            capabilities: {},
+            clientInfo: { name: "test", version: "0.0.0" },
+          },
+        }),
+      })
+      expect(res.statusCode).toBe(500)
+      expect(JSON.parse(res.body).error.message).toBe("Internal error")
+      expect(res.body).not.toContain("/srv/secret/path")
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it("still returns SessionError messages to the client", async () => {
+    ;({ server } = await startServer())
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+    const res = await request(port, "/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "mcp-session-id": "nope", ...AUTH },
+      body: "{}",
+    })
+    expect(res.statusCode).toBe(404)
+    expect(JSON.parse(res.body).error.message).toBe("Session not found or expired")
+  })
 })

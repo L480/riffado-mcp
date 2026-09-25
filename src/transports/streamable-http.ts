@@ -349,7 +349,10 @@ export class StreamableHttpServer implements RiffadoTransportServer {
             jsonrpc: "2.0",
             error: {
               code: -32000,
-              message: error instanceof Error ? error.message : "Internal error",
+              // Only SessionError messages are written for clients; anything
+              // else may carry internals (SQL, paths, stack-ish detail) and is
+              // logged above instead.
+              message: error instanceof SessionError ? error.message : "Internal error",
             },
             id: null,
           })
@@ -380,11 +383,8 @@ export class StreamableHttpServer implements RiffadoTransportServer {
         const details = await this.options.healthCheck()
         res.status(200).json({ ...base, ...details })
       } catch (error) {
-        res.status(200).json({
-          ...base,
-          status: "degraded",
-          error: error instanceof Error ? error.message : String(error),
-        })
+        console.error("Health check failed:", error)
+        res.status(200).json({ ...base, status: "degraded", error: "Health check failed" })
       }
     })
   }
