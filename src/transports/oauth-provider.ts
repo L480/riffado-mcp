@@ -438,10 +438,12 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    const req = res.req as { body?: Record<string, unknown>; query?: Record<string, unknown> }
-    const submitted =
-      (req?.body?.mcp_auth_token as string | undefined) ??
-      (req?.query?.mcp_auth_token as string | undefined)
+    // The shared secret is only ever read from a POST body. A query-string
+    // copy (`GET /authorize?...&mcp_auth_token=...`) would land in browser
+    // history, proxy/access logs and Referer headers, so it's ignored and
+    // the login page is shown instead.
+    const req = res.req as { method?: string; body?: Record<string, unknown> } | undefined
+    const submitted = req?.method === "POST" ? req.body?.mcp_auth_token : undefined
 
     if (typeof submitted !== "string" || submitted.length === 0) {
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8")

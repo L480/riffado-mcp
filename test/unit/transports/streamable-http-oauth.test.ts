@@ -141,6 +141,25 @@ describe("StreamableHttpServer OAuth flow", () => {
     expect(res.body).toContain("&lt;script&gt;")
   })
 
+  it("never accepts the shared token from the /authorize query string", async () => {
+    const registerRes = await request(port, "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["http://localhost/callback"],
+        token_endpoint_auth_method: "none",
+      }),
+    })
+    const client = JSON.parse(registerRes.body)
+    const res = await request(
+      port,
+      `/authorize?response_type=code&client_id=${client.client_id}&redirect_uri=http://localhost/callback&code_challenge=x&code_challenge_method=S256&mcp_auth_token=super-secret-token`,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(res.headers.location).toBeUndefined()
+    expect(res.body).toContain('name="mcp_auth_token"')
+  })
+
   it("completes the full authorization-code + PKCE flow and issues a usable token", async () => {
     const registerRes = await request(port, "/register", {
       method: "POST",

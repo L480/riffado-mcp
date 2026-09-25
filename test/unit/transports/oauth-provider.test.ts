@@ -381,3 +381,44 @@ describe("StaticTokenOAuthProvider refresh token TTL", () => {
     expect(raw).not.toContain(tokens.refresh_token!)
   })
 })
+
+describe("StaticTokenOAuthProvider authorize() token source", () => {
+  const params = {
+    redirectUri: "http://localhost/callback",
+    codeChallenge: "challenge",
+    scopes: [],
+  }
+
+  it("ignores a correct token passed in the query string and shows the login page", async () => {
+    const provider = newProvider()
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method: "GET", query: { mcp_auth_token: TOKEN } })
+    await provider.authorize(client, params, res)
+    expect(out.location).toBeUndefined()
+    expect(out.statusCode).toBe(200)
+    expect(out.body).toContain('name="mcp_auth_token"')
+  })
+
+  it("ignores a token in the body of a non-POST request", async () => {
+    const provider = newProvider()
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method: "GET", body: { mcp_auth_token: TOKEN } })
+    await provider.authorize(client, params, res)
+    expect(out.location).toBeUndefined()
+  })
+
+  it("accepts the token from a POST body", async () => {
+    const provider = newProvider()
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method: "POST", body: { mcp_auth_token: TOKEN } })
+    await provider.authorize(client, params, res)
+    expect(out.statusCode).toBe(302)
+    expect(new URL(out.location!).searchParams.get("code")).toBeTruthy()
+  })
+})

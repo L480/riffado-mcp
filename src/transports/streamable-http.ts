@@ -116,12 +116,14 @@ export class StreamableHttpServer implements RiffadoTransportServer {
     this.app.set("trust proxy", this.options.trustProxy ?? false)
 
     if (this.options.enableRequestLogging) {
+      // `req.path`, never `req.url`: query strings can carry OAuth codes,
+      // state and other secrets that don't belong in logs.
       this.app.use((req: Request, res: Response, next: NextFunction) => {
         const start = Date.now()
-        console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - ${req.ip}`)
+        console.error(`[${new Date().toISOString()}] ${req.method} ${req.path} - ${req.ip}`)
         res.on("finish", () => {
           console.error(
-            `[${new Date().toISOString()}] ${req.method} ${req.url} - ${res.statusCode} - ${Date.now() - start}ms`,
+            `[${new Date().toISOString()}] ${req.method} ${req.path} - ${res.statusCode} - ${Date.now() - start}ms`,
           )
         })
         next()

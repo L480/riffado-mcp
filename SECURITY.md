@@ -61,6 +61,10 @@ That makes the deployment, not just the code, part of the security surface:
   on startup, state issued under a different token is discarded and the file
   rewritten, so every connector has to log in again with the new secret. This
   is the way to cut off a leaked access or refresh token.
+- **The shared token never travels in a URL.** The OAuth login page only
+  accepts it from a POST body (a `?mcp_auth_token=` query parameter is
+  ignored), and the request log records the path only, never the query
+  string, so authorization codes and `state` don't end up in logs either.
 - **OAuth client registration (`/register`) is unauthenticated by spec** —
   Claude's dynamic client registration has to be. The registry is capped
   (default 100 clients, oldest evicted first) so an anonymous caller can't

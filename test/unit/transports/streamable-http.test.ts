@@ -1,6 +1,6 @@
 import http from "http"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { StreamableHttpServer } from "../../../src/transports/streamable-http.js"
 
 const TOKEN = "test-shared-secret-test-shared-secret"
@@ -367,5 +367,20 @@ describe("StreamableHttpServer", () => {
       // @ts-expect-error private property access for test
       expect(server.options.sessionTimeoutMs).toBe(3600000)
     })
+  })
+
+  it("logs only the request path, never the query string", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {})
+    try {
+      ;({ server } = await startServer({ enableRequestLogging: true }))
+      // @ts-expect-error private property access for test
+      const port = (server.server as http.Server).address().port
+      await request(port, "/health?code=leaky-code&state=leaky-state")
+      const lines = log.mock.calls.map((args) => args.join(" "))
+      expect(lines.some((l) => l.includes("GET /health"))).toBe(true)
+      expect(lines.some((l) => l.includes("leaky-code") || l.includes("leaky-state"))).toBe(false)
+    } finally {
+      log.mockRestore()
+    }
   })
 })
