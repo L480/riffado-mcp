@@ -617,6 +617,19 @@ describe("StaticTokenOAuthProvider refresh token TTL", () => {
     expect(raw).not.toContain(sha256(tokens.access_token))
     expect(raw).not.toContain(sha256(tokens.refresh_token!))
   })
+
+  it("prunes expired tokens from memory even without a state file", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] })
+    const provider = newProvider({ accessTokenTtlSeconds: 60, refreshTokenTtlSeconds: 60 })
+    await issueTokens(provider)
+    // @ts-expect-error private map, inspected for the test
+    const sizes = () => [provider.accessTokens.size, provider.refreshTokens.size]
+    expect(sizes()).toEqual([1, 1])
+
+    vi.setSystemTime(Date.now() + 120_000)
+    provider.clientsStore.registerClient!(clientMetadata("trigger-a-state-change"))
+    expect(sizes()).toEqual([0, 0])
+  })
 })
 
 describe("StaticTokenOAuthProvider authorize() token source", () => {
@@ -747,6 +760,48 @@ describe("StaticTokenOAuthProvider token storage and lifetimes", () => {
     vi.useRealTimers()
     vi.restoreAllMocks()
     fs.rmSync(stateFile, { force: true })
+  })
+
+  it("rolls a refresh back when the rotated state can't be persisted, also across a restart", async () => {
+    const provider = newProvider({ stateFile })
+    const { client, tokens } = await issueTokens(provider)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("ENOSPC: no space left on device")
+    })
+
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /Could not persist/,
+    )
+    write.mockRestore()
+
+    // Memory and disk still agree: the old pair works, here and after a restart.
+    expect(provider.getValidAccessToken(tokens.access_token)).toBeDefined()
+    const restarted = newProvider({ stateFile })
+    expect(restarted.getValidAccessToken(tokens.access_token)).toBeDefined()
+    const rotated = await restarted.exchangeRefreshToken(client, tokens.refresh_token!)
+    expect(rotated.access_token).toBeTruthy()
+    // ...and once a rotation does persist, the old pair is gone for good.
+    const again = newProvider({ stateFile })
+    expect(again.getValidAccessToken(tokens.access_token)).toBeUndefined()
+    await expect(again.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /Invalid refresh token/,
+    )
+  })
+
+  it("reports a revocation that can't be persisted instead of a false success", async () => {
+    const provider = newProvider({ stateFile })
+    const { client, tokens } = await issueTokens(provider)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("EROFS: read-only file system")
+    })
+
+    await expect(provider.revokeToken(client, { token: tokens.refresh_token! })).rejects.toThrow(
+      /could not be persisted/,
+    )
+    // Still revoked in memory.
+    expect(provider.getValidAccessToken(tokens.access_token)).toBeUndefined()
   })
 
   it("persists tokens only as SHA-256 hashes, in a versioned format", async () => {

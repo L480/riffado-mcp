@@ -157,8 +157,13 @@ hour, refresh tokens after 90 days. Each refresh rotates the refresh
 token, restarts that clock, and revokes the access token issued alongside
 the old one (the refresh token records its pair), so a grant has at most
 one live access token; a refresh may narrow scopes but not widen them.
-Expired tokens are dropped on load, on refresh, and on every state write;
-expired authorization codes whenever a new one is issued.
+Expired tokens are dropped on load and whenever state changes (with or
+without a state file); expired authorization codes whenever a new one is
+issued. Persisting a fresh grant is best-effort (a failed write only loses
+that grant on restart), but anything that removes access is not: a refresh
+whose rotated state can't be written is rolled back and fails, and a
+revocation that can't be written is reported as an error, so a revoked
+token can never be resurrected from a stale file.
 
 Dynamic client registration is open by spec, which makes two things
 attacker-controlled: the redirect URI and the registry size. Redirect URIs

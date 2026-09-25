@@ -67,6 +67,11 @@ That makes the deployment, not just the code, part of the security surface:
   write. Access tokens live 1 hour, refresh tokens 90 days; each refresh
   rotates the refresh token, restarts its lifetime and revokes the access
   token issued with the old one, and may not widen the original scopes.
+  Rotation and revocation must reach disk: if the state file can't be
+  written, a refresh is rolled back (the old token keeps working, the client
+  gets a server error and can retry) and a revocation is reported as failed
+  instead of succeeding in memory only, so no revoked token can come back
+  after a restart.
 - **Upgrading from a pre-`version: 2` state file** (tokens stored unhashed)
   discards it on first start: every connector logs in again once.
 - **Rotating `HTTP_AUTH_TOKEN` revokes every OAuth grant.** The state file

@@ -635,11 +635,13 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * atomic on the same filesystem.
    */
   private persistState(): boolean {
+    // Pruned even without a state file, so expired tokens never accumulate
+    // in memory either.
+    this.pruneExpiredTokens()
+
     if (!this.stateFile) {
       return true
     }
-
-    this.pruneExpiredTokens()
 
     const state: PersistedState = {
       version: STATE_VERSION,
@@ -925,9 +927,27 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       throw new InvalidScopeError(`Scope exceeds the original grant: ${excess.join(" ")}`)
     }
 
+    // Rotate transactionally: if the new state can't be written, the old
+    // pair would still be on disk and come back after a restart, so roll
+    // the in-memory maps back instead and fail the refresh. The client can
+    // retry with the same (still valid) refresh token.
+    const oldAccessHash = stored.accessTokenHash
+    const oldAccess = oldAccessHash ? this.accessTokens.get(oldAccessHash) : undefined
     this.revokeRefreshToken(hash)
     const grantedScopes = requested.length > 0 ? [...new Set(requested)] : stored.scopes
-    return this.issueTokens(client.client_id, grantedScopes, stored.resource)
+    const issued = this.issueTokens(client.client_id, grantedScopes, stored.resource, {
+      persist: false,
+    })
+    if (!this.persistState()) {
+      this.accessTokens.delete(issued.accessTokenHash)
+      this.refreshTokens.delete(issued.refreshTokenHash)
+      this.refreshTokens.set(hash, stored)
+      if (oldAccessHash && oldAccess) {
+        this.accessTokens.set(oldAccessHash, oldAccess)
+      }
+      throw new ServerError("Could not persist rotated tokens; retry the refresh")
+    }
+    return issued.tokens
   }
 
   /** Deletes a refresh token and the access token issued with it. */
@@ -943,7 +963,19 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   }
 
   /** Issues a new access token (and rotating refresh token) for a client. */
-  private issueTokens(clientId: string, scopes: string[], resource?: string): OAuthTokens {
+  private issueTokens(clientId: string, scopes: string[], resource?: string): OAuthTokens
+  private issueTokens(
+    clientId: string,
+    scopes: string[],
+    resource: string | undefined,
+    options: { persist: false },
+  ): { tokens: OAuthTokens; accessTokenHash: string; refreshTokenHash: string }
+  private issueTokens(
+    clientId: string,
+    scopes: string[],
+    resource?: string,
+    options?: { persist: false },
+  ): OAuthTokens | { tokens: OAuthTokens; accessTokenHash: string; refreshTokenHash: string } {
     const accessToken = base64url(randomBytes(32))
     const refreshToken = base64url(randomBytes(32))
     const accessTokenHash = hashToken(accessToken)
@@ -955,22 +987,29 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       expiresAt: now + this.accessTokenTtlSeconds,
       resource: resource ?? this.resource,
     })
-    this.refreshTokens.set(hashToken(refreshToken), {
+    const refreshTokenHash = hashToken(refreshToken)
+    this.refreshTokens.set(refreshTokenHash, {
       clientId,
       scopes,
       resource,
       expiresAt: now + this.refreshTokenTtlSeconds,
       accessTokenHash,
     })
-    this.persistState()
 
-    return {
+    const tokens: OAuthTokens = {
       access_token: accessToken,
       token_type: "Bearer",
       expires_in: this.accessTokenTtlSeconds,
       refresh_token: refreshToken,
       scope: scopes.length > 0 ? scopes.join(" ") : undefined,
     }
+    if (options?.persist === false) {
+      return { tokens, accessTokenHash, refreshTokenHash }
+    }
+    // Best-effort for a fresh grant: a failed write only loses the new
+    // grant on restart (the connector logs in again), it never revives one.
+    this.persistState()
+    return tokens
   }
 
   /** Verifies an issued access token, returning its auth info or throwing. */
@@ -1027,6 +1066,11 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     if (this.refreshTokens.get(hash)?.clientId === client.client_id) {
       this.revokeRefreshToken(hash)
     }
-    this.persistState()
+    // The revocation holds in memory either way, but if it can't be written
+    // the token would come back after a restart: report that instead of a
+    // false success.
+    if (!this.persistState()) {
+      throw new ServerError("Token revoked in memory but could not be persisted; retry")
+    }
   }
 }
