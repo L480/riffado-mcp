@@ -105,6 +105,21 @@ describe("StreamableHttpServer OAuth flow", () => {
     expect(res.headers["www-authenticate"]).toContain("resource_metadata=")
   })
 
+  it("issues confidential clients a secret that does not expire", async () => {
+    const registerRes = await request(port, "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["http://localhost/callback"],
+        token_endpoint_auth_method: "client_secret_post",
+      }),
+    })
+    expect(registerRes.statusCode).toBe(201)
+    const client = JSON.parse(registerRes.body)
+    expect(client.client_secret).toBeTruthy()
+    expect(client.client_secret_expires_at).toBe(0)
+  })
+
   it("renders the Riffado-branded login page", async () => {
     const registerRes = await request(port, "/register", {
       method: "POST",

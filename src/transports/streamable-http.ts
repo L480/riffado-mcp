@@ -397,6 +397,12 @@ export class StreamableHttpServer implements RiffadoTransportServer {
           baseUrl: issuerUrl,
           resourceServerUrl,
           resourceName: "Riffado MCP",
+          // The SDK expires confidential clients' secrets after 30 days by
+          // default, which would log a connector out monthly regardless of
+          // the refresh-token TTL. Grant lifetime is governed by the tokens
+          // (and rotating HTTP_AUTH_TOKEN wipes clients too), so the secret
+          // itself doesn't expire.
+          clientRegistrationOptions: { clientSecretExpirySeconds: 0 },
         }),
       )
 
