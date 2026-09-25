@@ -111,6 +111,42 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;")
 }
 
+/**
+ * A CSP source expression for the origin of `url`, or `undefined` if it
+ * can't be expressed safely. WHATWG URL parsing lets characters such as
+ * `;`, `,` and `'` through in hostnames, and those would break out of the
+ * directive (header injection into our own CSP), so anything beyond a plain
+ * `scheme://host[:port]` falls back to a bare scheme source (`https:`),
+ * and custom-scheme redirect URIs (opaque origin, e.g. `cursor://…`) use
+ * the scheme source too.
+ */
+export function cspSourceFor(url: string): string | undefined {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return undefined
+  }
+  const schemeSource = /^[a-z][a-z0-9+.-]*:$/i.test(parsed.protocol) ? parsed.protocol : undefined
+  if (parsed.origin !== "null" && /^[a-z][a-z0-9+.-]*:\/\/[a-z0-9.\-[\]:]+$/i.test(parsed.origin)) {
+    return parsed.origin
+  }
+  return schemeSource
+}
+
+/** Where a redirect URI sends the user, for display on the login page. */
+function redirectTargetLabel(redirectUri: string): string {
+  try {
+    const parsed = new URL(redirectUri)
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      return parsed.host
+    }
+    return parsed.host ? `${parsed.protocol}//${parsed.host}` : parsed.protocol
+  } catch {
+    return redirectUri
+  }
+}
+
 /** Base64url-encodes a buffer without padding, suitable for opaque tokens. */
 function base64url(buffer: Buffer): string {
   return buffer.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
@@ -410,7 +446,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
 <body>
   <form class="card" method="post" action="${escapeHtml(this.authorizeEndpoint)}">
     <h1>Connect to ${escapeHtml(this.serverName)}</h1>
-    <p>${clientLabel} wants to connect. Enter the access token to authorize.</p>
+    <p>${clientLabel} wants to connect and will be redirected to <strong>${escapeHtml(redirectTargetLabel(params.redirectUri))}</strong>. Only continue if you expect that. Enter the access token to authorize.</p>
     ${errorBlock}
     <label for="mcp_auth_token">Access token</label>
     <input id="mcp_auth_token" name="mcp_auth_token" type="password" autocomplete="off" autofocus required />
@@ -429,6 +465,34 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
   }
 
   /**
+   * Hardening headers for every response `authorize()` produces. The login
+   * page needs only its inline `<style>` and a form post; `form-action`
+   * covers the authorize endpoint the form posts to *and* the client's
+   * redirect origin, because some browsers apply `form-action` to the 302
+   * that follows a successful login too.
+   */
+  private setAuthorizeSecurityHeaders(res: Response, redirectUri: string): void {
+    const formAction = new Set(["'self'"])
+    for (const source of [cspSourceFor(this.authorizeEndpoint), cspSourceFor(redirectUri)]) {
+      if (source) formAction.add(source)
+    }
+    res.setHeader(
+      "Content-Security-Policy",
+      [
+        "default-src 'none'",
+        "style-src 'unsafe-inline'",
+        `form-action ${[...formAction].join(" ")}`,
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+      ].join("; "),
+    )
+    res.setHeader("X-Frame-Options", "DENY")
+    res.setHeader("Referrer-Policy", "no-referrer")
+    res.setHeader("Cache-Control", "no-store")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+  }
+
+  /**
    * Handles the authorization endpoint. On the initial GET a login page is
    * rendered; once the correct token is submitted an authorization code is
    * issued and the user agent is redirected back to the client.
@@ -444,6 +508,8 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     // the login page is shown instead.
     const req = res.req as { method?: string; body?: Record<string, unknown> } | undefined
     const submitted = req?.method === "POST" ? req.body?.mcp_auth_token : undefined
+
+    this.setAuthorizeSecurityHeaders(res, params.redirectUri)
 
     if (typeof submitted !== "string" || submitted.length === 0) {
       res.status(200).setHeader("Content-Type", "text/html; charset=utf-8")

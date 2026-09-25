@@ -133,7 +133,8 @@ npm run build
    Tunnel.
 2. In Claude, add a custom connector pointing at
    `https://riffado-mcp.example.com/mcp`.
-3. Claude opens the login page; paste the `HTTP_AUTH_TOKEN` value. Claude
+3. Claude opens the login page, which names the host it will redirect to
+   (for Claude, `claude.ai`); paste the `HTTP_AUTH_TOKEN` value. Claude
    then holds a normal OAuth bearer token — the connector survives process
    restarts because OAuth state is persisted to `HTTP_OAUTH_STATE_FILE`.
    Rotating `HTTP_AUTH_TOKEN` revokes every issued OAuth token and

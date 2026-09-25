@@ -115,6 +115,11 @@ export class StreamableHttpServer implements RiffadoTransportServer {
     // this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
     this.app.set("trust proxy", this.options.trustProxy ?? false)
 
+    this.app.use((_req: Request, res: Response, next: NextFunction) => {
+      res.setHeader("X-Content-Type-Options", "nosniff")
+      next()
+    })
+
     if (this.options.enableRequestLogging) {
       // `req.path`, never `req.url`: query strings can carry OAuth codes,
       // state and other secrets that don't belong in logs.
@@ -166,6 +171,17 @@ export class StreamableHttpServer implements RiffadoTransportServer {
         legacyHeaders: false,
       }),
     )
+
+    // Baseline hardening for everything under /authorize, including the
+    // SDK's own error responses. The provider's authorize() replaces the CSP
+    // with one that also allows the login form post and client redirect.
+    this.app.use("/authorize", (_req: Request, res: Response, next: NextFunction) => {
+      res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+      res.setHeader("X-Frame-Options", "DENY")
+      res.setHeader("Referrer-Policy", "no-referrer")
+      res.setHeader("Cache-Control", "no-store")
+      next()
+    })
 
     this.setupOAuth()
 

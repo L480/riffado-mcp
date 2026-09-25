@@ -4,7 +4,7 @@ import path from "path"
 import { randomBytes } from "crypto"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Response } from "express"
-import { StaticTokenOAuthProvider } from "../../../src/transports/oauth-provider.js"
+import { StaticTokenOAuthProvider, cspSourceFor } from "../../../src/transports/oauth-provider.js"
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js"
 
 function clientMetadata(
@@ -420,5 +420,78 @@ describe("StaticTokenOAuthProvider authorize() token source", () => {
     await provider.authorize(client, params, res)
     expect(out.statusCode).toBe(302)
     expect(new URL(out.location!).searchParams.get("code")).toBeTruthy()
+  })
+})
+
+describe("StaticTokenOAuthProvider login page", () => {
+  async function renderFor(redirectUri: string, method = "GET", body?: Record<string, unknown>) {
+    const provider = newProvider({ authorizeEndpoint: "https://mcp.example.com/authorize" })
+    const client = provider.clientsStore.registerClient!(
+      clientMetadata("c"),
+    ) as OAuthClientInformationFull
+    const { res, out } = fakeResponse({ method, body })
+    await provider.authorize(client, { redirectUri, codeChallenge: "x", scopes: [] }, res)
+    return out
+  }
+
+  it("shows the redirect target host so the user sees where the code goes", async () => {
+    const out = await renderFor("https://claude.ai/api/mcp/auth_callback")
+    expect(out.body).toContain("will be redirected to <strong>claude.ai</strong>")
+  })
+
+  it("escapes the redirect host", async () => {
+    const out = await renderFor("http://a'b/cb")
+    expect(out.body).toContain("<strong>a&#39;b</strong>")
+    expect(out.body).not.toContain("a'b")
+  })
+
+  it("shows the scheme for custom-scheme redirect URIs", async () => {
+    const out = await renderFor("cursor://anysphere.cursor-retrieval/oauth/callback")
+    expect(out.body).toContain("<strong>cursor://anysphere.cursor-retrieval</strong>")
+  })
+
+  it("sets security headers, with the redirect origin allowed in form-action", async () => {
+    const out = await renderFor("https://claude.ai/api/mcp/auth_callback")
+    const csp = out.headers["content-security-policy"]
+    expect(csp).toContain("default-src 'none'")
+    expect(csp).toContain("style-src 'unsafe-inline'")
+    expect(csp).toContain("frame-ancestors 'none'")
+    expect(csp).toMatch(/form-action 'self' https:\/\/mcp\.example\.com https:\/\/claude\.ai(;|$)/)
+    expect(out.headers["x-frame-options"]).toBe("DENY")
+    expect(out.headers["referrer-policy"]).toBe("no-referrer")
+    expect(out.headers["cache-control"]).toBe("no-store")
+    expect(out.headers["x-content-type-options"]).toBe("nosniff")
+  })
+
+  it("sets the same headers on the wrong-token page and the success redirect", async () => {
+    const wrong = await renderFor("https://claude.ai/cb", "POST", { mcp_auth_token: "nope" })
+    expect(wrong.statusCode).toBe(401)
+    expect(wrong.headers["x-frame-options"]).toBe("DENY")
+    const ok = await renderFor("https://claude.ai/cb", "POST", { mcp_auth_token: TOKEN })
+    expect(ok.statusCode).toBe(302)
+    expect(ok.headers["cache-control"]).toBe("no-store")
+    expect(ok.headers["content-security-policy"]).toContain("https://claude.ai")
+  })
+})
+
+describe("cspSourceFor", () => {
+  it("returns the origin for plain http(s) URLs", () => {
+    expect(cspSourceFor("https://claude.ai/api/cb")).toBe("https://claude.ai")
+    expect(cspSourceFor("http://localhost:6274/cb")).toBe("http://localhost:6274")
+  })
+
+  it("falls back to a scheme source for custom schemes", () => {
+    expect(cspSourceFor("cursor://anysphere.cursor-retrieval/cb")).toBe("cursor:")
+    expect(cspSourceFor("com.example.app:/cb")).toBe("com.example.app:")
+  })
+
+  it("never lets CSP metacharacters from a hostname into the header", () => {
+    expect(cspSourceFor("http://a;script-src*/cb")).toBe("http:")
+    expect(cspSourceFor("http://a,b/cb")).toBe("http:")
+    expect(cspSourceFor("http://a'b/cb")).toBe("http:")
+  })
+
+  it("returns undefined for unparseable input", () => {
+    expect(cspSourceFor("not a url")).toBeUndefined()
   })
 })

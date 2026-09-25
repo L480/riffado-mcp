@@ -108,6 +108,16 @@ describe("StreamableHttpServer", () => {
     expect(body.status).toBe("ok")
   })
 
+  it("sets X-Content-Type-Options: nosniff on every response", async () => {
+    ;({ server } = await startServer())
+    // @ts-expect-error private property access for test
+    const port = (server.server as http.Server).address().port
+    expect((await request(port, "/health")).headers["x-content-type-options"]).toBe("nosniff")
+    const unauthed = await request(port, "/mcp", { method: "POST", body: "{}" })
+    expect(unauthed.statusCode).toBe(401)
+    expect(unauthed.headers["x-content-type-options"]).toBe("nosniff")
+  })
+
   it("exposes only status+timestamp on /health, nothing else", async () => {
     ;({ server } = await startServer({
       healthCheck: async () => ({ database: { reachable: true }, recordings: { cached: 3 } }),

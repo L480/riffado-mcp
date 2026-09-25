@@ -65,6 +65,15 @@ That makes the deployment, not just the code, part of the security surface:
   accepts it from a POST body (a `?mcp_auth_token=` query parameter is
   ignored), and the request log records the path only, never the query
   string, so authorization codes and `state` don't end up in logs either.
+- **Check the redirect host on the login page.** `/register` is open, so
+  anyone can register a client with their own redirect URI and send you an
+  authorize link. The login page names the host the authorization code will
+  be sent to; only enter the token if that is the client you expect (for
+  Claude, `claude.ai`). The page is served with `X-Frame-Options: DENY`, a
+  restrictive CSP (`frame-ancestors 'none'`, `form-action` limited to this
+  server and that redirect origin), `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`; every response carries
+  `X-Content-Type-Options: nosniff`.
 - **OAuth client registration (`/register`) is unauthenticated by spec** —
   Claude's dynamic client registration has to be. The registry is capped
   (default 100 clients, oldest evicted first) so an anonymous caller can't

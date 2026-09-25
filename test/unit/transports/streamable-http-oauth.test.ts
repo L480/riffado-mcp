@@ -122,6 +122,39 @@ describe("StreamableHttpServer OAuth flow", () => {
     expect(res.body).toContain("Connect to Riffado MCP")
   })
 
+  it("serves the login page with anti-framing / no-store / CSP headers", async () => {
+    const registerRes = await request(port, "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        redirect_uris: ["http://localhost/callback"],
+        token_endpoint_auth_method: "none",
+      }),
+    })
+    const client = JSON.parse(registerRes.body)
+    const res = await request(
+      port,
+      `/authorize?response_type=code&client_id=${client.client_id}&redirect_uri=http://localhost/callback&code_challenge=x&code_challenge_method=S256`,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toContain("will be redirected to <strong>localhost</strong>")
+    expect(res.headers["x-frame-options"]).toBe("DENY")
+    expect(res.headers["referrer-policy"]).toBe("no-referrer")
+    expect(res.headers["cache-control"]).toBe("no-store")
+    expect(res.headers["x-content-type-options"]).toBe("nosniff")
+    expect(res.headers["content-security-policy"]).toContain("form-action 'self'")
+    expect(res.headers["content-security-policy"]).toContain("http://localhost")
+    expect(res.headers["content-security-policy"]).toContain("frame-ancestors 'none'")
+  })
+
+  it("sets baseline hardening headers on /authorize errors from the SDK too", async () => {
+    const res = await request(port, "/authorize?client_id=unknown")
+    expect(res.statusCode).toBeGreaterThanOrEqual(400)
+    expect(res.headers["x-frame-options"]).toBe("DENY")
+    expect(res.headers["cache-control"]).toBe("no-store")
+    expect(res.headers["content-security-policy"]).toContain("frame-ancestors 'none'")
+  })
+
   it("escapes HTML in the client name on the login page", async () => {
     const registerRes = await request(port, "/register", {
       method: "POST",
