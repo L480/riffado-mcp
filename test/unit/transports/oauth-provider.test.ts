@@ -831,6 +831,56 @@ describe("StaticTokenOAuthProvider token storage and lifetimes", () => {
     )
   })
 
+  it("while a revocation is unpersisted, unknown/foreign revocations stay no-ops but new grants are refused", async () => {
+    const provider = newProvider({ stateFile })
+    const a = await issueTokens(provider)
+    const b = await issueTokens(provider)
+    // A login in flight: code issued before the disk fails, exchanged after.
+    const { res, out } = fakeResponse({ method: "POST", body: { mcp_auth_token: TOKEN } })
+    await provider.authorize(
+      b.client,
+      { redirectUri: "http://localhost/callback", codeChallenge: "challenge", scopes: [] },
+      res,
+    )
+    const code = new URL(out.location!).searchParams.get("code")!
+
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("ENOSPC: no space left on device")
+    })
+    await expect(
+      provider.revokeToken(a.client, { token: a.tokens.refresh_token! }),
+    ).rejects.toThrow(/could not be persisted/)
+
+    // RFC 7009 no-ops are unaffected by the pending write.
+    await expect(provider.revokeToken(a.client, { token: "never-issued" })).resolves.toBeUndefined()
+    await expect(
+      provider.revokeToken(b.client, { token: a.tokens.refresh_token! }),
+    ).resolves.toBeUndefined()
+
+    // No new grant while the file could still revive a's tokens.
+    await expect(provider.exchangeRefreshToken(b.client, b.tokens.refresh_token!)).rejects.toThrow(
+      /not been persisted/,
+    )
+    await expect(provider.exchangeAuthorizationCode(b.client, code)).rejects.toThrow(
+      /not been persisted/,
+    )
+
+    // Disk recovers: the blocked calls go through (code wasn't consumed),
+    // and the revocation reached the file on the way.
+    write.mockRestore()
+    await expect(provider.exchangeAuthorizationCode(b.client, code)).resolves.toHaveProperty(
+      "access_token",
+    )
+    await expect(
+      provider.exchangeRefreshToken(b.client, b.tokens.refresh_token!),
+    ).resolves.toHaveProperty("access_token")
+    const restarted = newProvider({ stateFile })
+    await expect(restarted.exchangeRefreshToken(a.client, a.tokens.refresh_token!)).rejects.toThrow(
+      /Invalid refresh token/,
+    )
+  })
+
   it("drops persisted access tokens whose resource isn't a valid URL", async () => {
     const provider = newProvider({ stateFile })
     const { tokens } = await issueTokens(provider)

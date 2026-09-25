@@ -162,7 +162,8 @@ without a state file); expired authorization codes whenever a new one is
 issued. Persisting a fresh grant is best-effort (a failed write only loses
 that grant on restart), but anything that removes access is not: a refresh
 whose rotated state can't be written is rolled back and fails, and a
-revocation that can't be written is reported as an error, so a revoked
+revocation that can't be written is reported as an error and blocks new
+grants until a retry (or any later write) gets it to disk, so a revoked
 token can never be resurrected from a stale file.
 
 Dynamic client registration is open by spec, which makes two things

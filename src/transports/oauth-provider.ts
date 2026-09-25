@@ -638,12 +638,14 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
    * atomic on the same filesystem.
    */
   /**
-   * Set when a write failed, so the file may hold grants that are already
-   * revoked in memory. Cleared by the next successful write; while set,
-   * a retried revocation writes again even if the token is already gone
-   * from memory.
+   * Hashes of tokens revoked in memory whose revocation hasn't reached the
+   * state file yet (the write failed), so the file could still revive
+   * them on restart. A retried revocation of one of these rewrites the
+   * file; unknown/foreign tokens stay a no-op. While any are pending, no
+   * new grant is issued (see `ensureRevocationsPersisted`). Cleared by the
+   * next successful write.
    */
-  private stateFileStale = false
+  private readonly pendingRevocations = new Map<string, string>() // token hash -> client id
 
   private persistState(): boolean {
     // Pruned even without a state file, so expired tokens never accumulate
@@ -670,7 +672,7 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     try {
       fs.writeFileSync(tmpFile, JSON.stringify(state), { mode: 0o600 })
       fs.renameSync(tmpFile, this.stateFile)
-      this.stateFileStale = false
+      this.pendingRevocations.clear()
       return true
     } catch (error) {
       try {
@@ -680,8 +682,21 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       }
       const message = error instanceof Error ? error.message : String(error)
       console.error(`Failed to persist OAuth state to ${this.stateFile}: ${message}`)
-      this.stateFileStale = true
       return false
+    }
+  }
+
+  /**
+   * Refuses to issue a new grant while a revocation hasn't reached the
+   * state file: the grant's own write could fail as well, and the process
+   * would keep serving on a file that still revives revoked tokens on
+   * restart. Retries the write first, so a recovered disk unblocks at once.
+   */
+  private ensureRevocationsPersisted(): void {
+    if (this.pendingRevocations.size > 0 && !this.persistState()) {
+      throw new ServerError(
+        "A token revocation has not been persisted yet; no new grants until the state file is writable",
+      )
     }
   }
 
@@ -894,6 +909,8 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
     if (!stored || stored.clientId !== client.client_id) {
       throw new InvalidGrantError("Invalid authorization code")
     }
+    // Before consuming the code, so a blocked exchange can be retried.
+    this.ensureRevocationsPersisted()
     this.authorizationCodes.delete(authorizationCode)
 
     if (stored.expiresAt <= Date.now()) {
@@ -943,6 +960,8 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       // refresh token usable.
       throw new InvalidScopeError(`Scope exceeds the original grant: ${excess.join(" ")}`)
     }
+
+    this.ensureRevocationsPersisted()
 
     // Rotate transactionally: if the new state can't be written, the old
     // pair would still be on disk and come back after a restart, so roll
@@ -1087,13 +1106,16 @@ export class StaticTokenOAuthProvider implements OAuthServerProvider {
       revoked = true
     }
     // Unknown or foreign tokens are a successful no-op (RFC 7009), with no
-    // write attempted -- unless an earlier write failed: then a retry of a
-    // revocation (whose token is already gone from memory) must still get
-    // the file rewritten. A revocation stays in effect in memory either way
-    // (rolling it back would re-enable a token the client asked to kill),
-    // but if it can't be written it would come back after a restart, so
-    // that's reported instead of a false success.
-    if ((revoked || this.stateFileStale) && !this.persistState()) {
+    // write attempted. The one exception is this client retrying a
+    // revocation whose earlier write failed: the token is already gone from
+    // memory, but the file still holds it, so it must be rewritten. A
+    // revocation stays in effect in memory either way (rolling it back
+    // would re-enable a token the client asked to kill), but until it's
+    // written it could come back after a restart, so that's reported
+    // instead of a false success.
+    const retryingPending = this.pendingRevocations.get(hash) === client.client_id
+    if ((revoked || retryingPending) && !this.persistState()) {
+      this.pendingRevocations.set(hash, client.client_id)
       throw new ServerError("Token revoked in memory but could not be persisted; retry")
     }
   }
