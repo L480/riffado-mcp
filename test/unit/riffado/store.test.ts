@@ -435,3 +435,76 @@ describe("RecordingStore.getTranscripts()", () => {
     expect(calls).toHaveLength(2)
   })
 })
+
+describe("RecordingStore per-recording error isolation", () => {
+  it("a recording with an undecryptable field (bad GCM tag) is skipped, not fatal to the refresh", async () => {
+    const badFilename = corruptedSameIv(encryptForTest("Broken title"))
+    const bad = fixture({ id: "rec-bad", filename: badFilename })
+    const good = fixture({ id: "rec-good" })
+    const { pool } = fakePool({
+      stamp: [[bad.stamp, good.stamp]],
+      metadata: [[bad.meta, good.meta]],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    const recordings = await store.get()
+
+    expect(recordings.map((r) => r.id)).toEqual(["rec-good"])
+    const skipLine = errorSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((line) => line.includes("skipping recording rec-bad"))
+    expect(skipLine).toBeDefined()
+    expect(skipLine).not.toContain("Broken title")
+    expect(skipLine).not.toContain(badFilename)
+
+    errorSpy.mockRestore()
+  })
+
+  it("a recording with invalid JSON in key_points is skipped, not fatal to the refresh", async () => {
+    const bad = fixture({
+      id: "rec-bad-json",
+      keyPoints: pgJsonbWrapper(encryptForTest("not valid json")),
+    })
+    const good = fixture({ id: "rec-good" })
+    const { pool } = fakePool({
+      stamp: [[bad.stamp, good.stamp]],
+      metadata: [[bad.meta, good.meta]],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    const recordings = await store.get()
+
+    expect(recordings.map((r) => r.id)).toEqual(["rec-good"])
+    expect(
+      errorSpy.mock.calls.some((c) => String(c[0]).includes("skipping recording rec-bad-json")),
+    ).toBe(true)
+
+    errorSpy.mockRestore()
+  })
+})
+
+describe("RecordingStore.getTranscripts() error isolation", () => {
+  it("one undecryptable transcript row yields no text for that source, without throwing for the batch", async () => {
+    const badText = corruptedSameIv(encryptForTest("secret transcript"))
+    const { pool } = fakePool({
+      transcripts: [
+        { recording_id: "a", source: "riffado", text: badText },
+        { recording_id: "b", source: "riffado", text: encryptForTest("text b") },
+      ],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 60000 })
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    const byId = await store.getTranscripts(["a", "b"])
+
+    expect(byId.get("a")).toEqual([])
+    expect(byId.get("b")![0].text).toBe("text b")
+    expect(
+      errorSpy.mock.calls.some((c) => String(c[0]).includes("skipping transcript for recording a")),
+    ).toBe(true)
+
+    errorSpy.mockRestore()
+  })
+})
