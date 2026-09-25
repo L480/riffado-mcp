@@ -390,7 +390,11 @@ export class RecordingStore {
         }
       }
       if (!rec || !normalized) {
-        continue // vanished between phase 1 and phase 2 -- drop it, same as any other absence
+        // Failed to rebuild or vanished between phase 1 and phase 2. Forget
+        // its stamp too, so the next refresh fetches it again instead of
+        // treating it as "unchanged" and leaving it out until the row changes.
+        stampsById.delete(id)
+        continue
       }
       recordings.push(rec)
       recordingsById.set(id, rec)

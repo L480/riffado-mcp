@@ -67,9 +67,6 @@ export function decrypt(value: string | null | undefined, key: Buffer): string {
   if (!parsed) {
     return value
   }
-  const iv = Buffer.from(parsed.iv, "hex")
-  const tag = Buffer.from(parsed.tag, "hex")
-  const ciphertext = Buffer.from(parsed.ciphertext, "hex")
 
   // parseCiphertext only checks "3 hex parts" -- it has to stay that lax so
   // legacy plaintext detection (falling through to the `return value`
@@ -78,12 +75,23 @@ export function decrypt(value: string | null | undefined, key: Buffer): string {
   // recognized as v1 ciphertext, so a malformed/truncated value fails
   // loudly instead of silently passing a wrong-length IV/tag to Node's
   // crypto internals.
-  if (iv.length !== 12) {
-    throw new Error(`invalid v1 ciphertext: IV must be 12 bytes, got ${iv.length}`)
+  // Checked on the hex strings, not the decoded buffers: Buffer.from(hex)
+  // silently drops a trailing odd nibble, so a 25-char IV would decode to
+  // 12 bytes and an odd-length ciphertext would lose its last half-byte.
+  if (parsed.iv.length !== 24) {
+    throw new Error(`invalid v1 ciphertext: IV must be 24 hex chars, got ${parsed.iv.length}`)
   }
-  if (tag.length !== 16) {
-    throw new Error(`invalid v1 ciphertext: auth tag must be 16 bytes, got ${tag.length}`)
+  if (parsed.tag.length !== 32) {
+    throw new Error(
+      `invalid v1 ciphertext: auth tag must be 32 hex chars, got ${parsed.tag.length}`,
+    )
   }
+  if (parsed.ciphertext.length % 2 !== 0) {
+    throw new Error("invalid v1 ciphertext: ciphertext has an odd number of hex chars")
+  }
+  const iv = Buffer.from(parsed.iv, "hex")
+  const tag = Buffer.from(parsed.tag, "hex")
+  const ciphertext = Buffer.from(parsed.ciphertext, "hex")
 
   const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 })
   decipher.setAuthTag(tag)

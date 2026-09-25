@@ -490,6 +490,21 @@ describe("RecordingStore per-recording error isolation", () => {
     vi.restoreAllMocks()
   })
 
+  it("a recording that vanished mid-refresh is fetched again on the next refresh", async () => {
+    const f = fixture({ summary: encryptForTest("A summary") })
+    const { pool, calls } = fakePool({
+      stamp: [[f.stamp], [f.stamp]], // same stamp both times
+      metadata: [[], [f.meta]], // missing in phase 2 the first time only
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+    vi.spyOn(console, "error").mockImplementation(() => {})
+
+    expect(await store.get()).toEqual([])
+    expect((await store.get()).map((r) => r.summary)).toEqual(["A summary"])
+    expect(calls.filter((c) => c.kind === "metadata")).toHaveLength(2)
+    vi.restoreAllMocks()
+  })
+
   it("a recording with invalid JSON in key_points is skipped, not fatal to the refresh", async () => {
     const bad = fixture({
       id: "rec-bad-json",
