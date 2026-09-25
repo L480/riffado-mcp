@@ -71,6 +71,28 @@ describe("decrypt", () => {
     const corrupted = value.slice(0, -2) + "00"
     expect(() => decrypt(corrupted, KEY)).toThrow()
   })
+
+  it("throws a clear error for an IV that isn't 12 bytes, without touching crypto internals", () => {
+    const value = encrypt("secret", KEY)
+    const [, , tag, ciphertext] = value.split(":")
+    const shortIv = "aa".repeat(11) // 11 bytes, not 12
+    const bad = `v1:${shortIv}:${tag}:${ciphertext}`
+    expect(() => decrypt(bad, KEY)).toThrow(/IV must be 12 bytes/)
+  })
+
+  it("throws a clear error for a tag that isn't 16 bytes", () => {
+    const value = encrypt("secret", KEY)
+    const [, iv, , ciphertext] = value.split(":")
+    const shortTag = "bb".repeat(15) // 15 bytes, not 16
+    const bad = `v1:${iv}:${shortTag}:${ciphertext}`
+    expect(() => decrypt(bad, KEY)).toThrow(/auth tag must be 16 bytes/)
+  })
+
+  it("still treats a value with a wrong-length IV/tag but non-3-part shape as legacy plaintext (length checks only apply after v1 shape detection)", () => {
+    // Only 2 parts after stripping "v1:" -- parseCiphertext's shape check runs first and
+    // returns null, so this is legacy plaintext, never reaching the length validation.
+    expect(decrypt("v1:aabb:ccdd", KEY)).toBe("v1:aabb:ccdd")
+  })
 })
 
 describe("decryptJson", () => {

@@ -71,7 +71,21 @@ export function decrypt(value: string | null | undefined, key: Buffer): string {
   const tag = Buffer.from(parsed.tag, "hex")
   const ciphertext = Buffer.from(parsed.ciphertext, "hex")
 
-  const decipher = createDecipheriv("aes-256-gcm", key, iv)
+  // parseCiphertext only checks "3 hex parts" -- it has to stay that lax so
+  // legacy plaintext detection (falling through to the `return value`
+  // above) isn't disturbed. The standard AES-GCM sizes (12-byte IV,
+  // 16-byte tag) are only enforced here, once a value has already been
+  // recognized as v1 ciphertext, so a malformed/truncated value fails
+  // loudly instead of silently passing a wrong-length IV/tag to Node's
+  // crypto internals.
+  if (iv.length !== 12) {
+    throw new Error(`invalid v1 ciphertext: IV must be 12 bytes, got ${iv.length}`)
+  }
+  if (tag.length !== 16) {
+    throw new Error(`invalid v1 ciphertext: auth tag must be 16 bytes, got ${tag.length}`)
+  }
+
+  const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 })
   decipher.setAuthTag(tag)
   const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()])
   return plain.toString("utf8")

@@ -244,7 +244,19 @@ export class RecordingStore {
       const byId = new Map<string, TranscriptText[]>()
       for (const row of rows.rows) {
         const texts = byId.get(row.recording_id) ?? []
-        texts.push({ source: row.source, text: decrypt(row.text, this.encryptionKey) })
+        try {
+          texts.push({ source: row.source, text: decrypt(row.text, this.encryptionKey) })
+        } catch (err) {
+          // Same reasoning as buildRecording(): one undecryptable transcript
+          // row (bad GCM tag) must not fail the whole batch. Log only the
+          // recording id/source + error message, and yield no text for
+          // that source instead of throwing.
+          const message = err instanceof Error ? err.message : String(err)
+          console.error(
+            `[riffado-mcp] skipping transcript for recording ${row.recording_id} ` +
+              `(source ${row.source}): ${message}`,
+          )
+        }
         byId.set(row.recording_id, texts)
       }
       for (const id of misses) {
@@ -340,7 +352,17 @@ export class RecordingStore {
         }
       }
       for (const [id, rows] of rowsById) {
-        rebuiltById.set(id, this.buildRecording(rows))
+        try {
+          rebuiltById.set(id, this.buildRecording(rows))
+        } catch (err) {
+          // A bad GCM tag (decipher.final() throws) or invalid JSON in
+          // key_points/action_items for one recording must not break the
+          // whole refresh. Log only the id + error message -- never the
+          // plaintext/ciphertext -- and skip that recording; it simply
+          // won't appear in this refresh (same as a deleted/trashed one).
+          const message = err instanceof Error ? err.message : String(err)
+          console.error(`[riffado-mcp] skipping recording ${id}: ${message}`)
+        }
       }
     }
 
