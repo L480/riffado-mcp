@@ -184,6 +184,35 @@ describe("loadConfig", () => {
     })
   })
 
+  describe("HTTP_CORS_ORIGINS", () => {
+    it("defaults to no origins", () => {
+      expect(loadConfig(BASE_ENV).HTTP_CORS_ORIGINS).toEqual([])
+    })
+
+    it("accepts exact origins, trimmed and deduplicated", () => {
+      expect(
+        loadConfig({
+          ...BASE_ENV,
+          HTTP_CORS_ORIGINS:
+            " http://localhost:6274 ,https://app.example.com,,http://localhost:6274",
+        }).HTTP_CORS_ORIGINS,
+      ).toEqual(["http://localhost:6274", "https://app.example.com"])
+    })
+
+    it.each([
+      "*",
+      "https://app.example.com/",
+      "https://app.example.com/path",
+      "app.example.com",
+      "ftp://x.example",
+      "https://*.example.com",
+    ])("rejects %j", (value) => {
+      expect(() => loadConfig({ ...BASE_ENV, HTTP_CORS_ORIGINS: value })).toThrow(
+        /HTTP_CORS_ORIGINS entry #1/,
+      )
+    })
+  })
+
   describe("HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS", () => {
     it("defaults to Claude's callback hosts plus loopback", () => {
       expect(loadConfig(BASE_ENV).HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS).toEqual([

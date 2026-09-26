@@ -41,6 +41,7 @@ async function main(): Promise<void> {
       publicUrl: config.HTTP_PUBLIC_URL,
       oauthStateFile: config.HTTP_OAUTH_STATE_FILE,
       oauthAllowedRedirectHosts: config.HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS,
+      corsOrigins: config.HTTP_CORS_ORIGINS,
       trustProxy: config.HTTP_TRUST_PROXY,
       sessionTimeoutMs: config.HTTP_SESSION_TIMEOUT_MS,
       createServer: () => createRiffadoServer(store),

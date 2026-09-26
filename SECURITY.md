@@ -89,6 +89,11 @@ That makes the deployment, not just the code, part of the security surface:
   accepts it from a POST body (a `?mcp_auth_token=` query parameter is
   ignored), and the request log records the path only, never the query
   string, so authorization codes and `state` don't end up in logs either.
+- **No CORS by default.** The MCP endpoint sends no `Access-Control-*`
+  headers unless `HTTP_CORS_ORIGINS` lists exact browser origins; there is
+  no `*` option. Claude's connector calls server-to-server and doesn't need
+  CORS. The SDK's OAuth metadata/register/token/revoke endpoints keep their
+  own CORS, which browser-based discovery relies on.
 - **Redirect URIs are allowlisted.** `/register` is open, so without a check
   anyone could register a client with their own redirect URI and send you an
   authorize link that ends on their site. Registration only accepts redirect
