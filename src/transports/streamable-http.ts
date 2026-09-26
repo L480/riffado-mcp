@@ -194,6 +194,8 @@ export class StreamableHttpServer implements RiffadoTransportServer {
             "MCP-Session-ID",
             "MCP-Protocol-Version",
             "Authorization",
+            // The static-token header, so browser clients can use it too.
+            this.options.authHeaderName ?? "x-mcp-token",
           ],
           exposedHeaders: ["MCP-Session-ID", "WWW-Authenticate"],
         }),

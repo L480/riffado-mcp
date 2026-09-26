@@ -94,9 +94,29 @@ describe("StreamableHttpServer", () => {
     ;({ server, port } = await startServer({ corsOrigins: ["http://localhost:6274"] }))
     const allowed = await preflight(port, "http://localhost:6274")
     expect(allowed.headers["access-control-allow-origin"]).toBe("http://localhost:6274")
-    expect(String(allowed.headers["access-control-allow-headers"])).toMatch(/authorization/i)
+    const allowedHeaders = String(allowed.headers["access-control-allow-headers"]).toLowerCase()
+    for (const header of [
+      "authorization",
+      "x-mcp-token",
+      "mcp-protocol-version",
+      "mcp-session-id",
+    ]) {
+      expect(allowedHeaders).toContain(header)
+    }
     const other = await preflight(port, "https://evil.example")
     expect(other.headers["access-control-allow-origin"]).toBeUndefined()
+  })
+
+  it("allows a custom static-token header name in CORS preflights", async () => {
+    let port: number
+    ;({ server, port } = await startServer({
+      corsOrigins: ["http://localhost:6274"],
+      authHeaderName: "x-riffado-key",
+    }))
+    const res = await preflight(port, "http://localhost:6274")
+    expect(String(res.headers["access-control-allow-headers"]).toLowerCase()).toContain(
+      "x-riffado-key",
+    )
   })
 
   it("refuses to construct without an auth token (no unauthenticated mode)", () => {
