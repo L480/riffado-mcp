@@ -46,7 +46,9 @@ export interface StreamableHttpServerOptions {
   /** Express `trust proxy` setting (default `false`); set it (e.g. `1`)
    * behind a reverse proxy or the Cloudflare Tunnel. */
   trustProxy?: boolean | number | string
-  corsOptions?: cors.CorsOptions
+  /** Browser origins allowed cross-origin access (see `HTTP_CORS_ORIGINS`).
+   * Empty/unset: no CORS headers at all. */
+  corsOrigins?: readonly string[]
   requestTimeoutMs?: number
   maxRequestSizeBytes?: number
   enableRequestLogging?: boolean
@@ -176,18 +178,29 @@ export class StreamableHttpServer implements RiffadoTransportServer {
       void this.rejectLockedOutClients(req, res, next).catch(next)
     })
 
-    // CORS before auth so OAuth discovery endpoints and preflight requests
-    // are handled before auth kicks in.
-    this.app.use(
-      cors(
-        this.options.corsOptions || {
-          origin: "*",
+    // CORS only for explicitly allowed browser origins, and before auth so
+    // preflight requests are answered. Server-side clients (Claude's
+    // connector) don't need it, so the default is none at all rather than
+    // "*". The SDK's OAuth metadata/register/token/revoke handlers set their
+    // own CORS, which discovery from a browser relies on.
+    const corsOrigins = this.options.corsOrigins ?? []
+    if (corsOrigins.length > 0) {
+      this.app.use(
+        cors({
+          origin: [...corsOrigins],
           methods: ["GET", "POST", "DELETE"],
-          allowedHeaders: ["Content-Type", "MCP-Session-ID", "Authorization"],
+          allowedHeaders: [
+            "Content-Type",
+            "MCP-Session-ID",
+            "MCP-Protocol-Version",
+            "Authorization",
+            // The static-token header, so browser clients can use it too.
+            this.options.authHeaderName ?? "x-mcp-token",
+          ],
           exposedHeaders: ["MCP-Session-ID", "WWW-Authenticate"],
-        },
-      ),
-    )
+        }),
+      )
+    }
 
     // Tighter limit than the global one above, scoped to the unauthenticated
     // OAuth endpoints (dynamic client registration is unauthenticated by

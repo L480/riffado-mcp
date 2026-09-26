@@ -88,6 +88,47 @@ const trustProxyCoercion = z
   })
 
 /**
+ * Comma-separated browser origins allowed to call the server cross-origin
+ * (CORS), e.g. `http://localhost:6274` for the MCP Inspector. Default empty:
+ * no CORS at all, which is what server-side clients such as Claude's
+ * connector need. Each entry must be an exact `scheme://host[:port]` origin;
+ * `*` is rejected. Errors point at the entry by position, not its content.
+ */
+const corsOriginsFromEnv = z
+  .string()
+  .default("")
+  .transform((val, ctx) => {
+    const origins: string[] = []
+    for (const [index, raw] of val.split(",").entries()) {
+      const entry = raw.trim()
+      if (entry === "") continue
+      let origin: string | undefined
+      try {
+        const parsed = new URL(entry)
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          origin = parsed.origin
+        }
+      } catch {
+        origin = undefined
+      }
+      // "*" can't be expressed as an exact origin; reject it anywhere so a
+      // wildcard-looking entry ("https://*.example.com") never silently
+      // becomes a string that matches nothing.
+      if (origin === undefined || origin !== entry || entry.includes("*")) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            `HTTP_CORS_ORIGINS entry #${index + 1}: expected an exact origin like ` +
+            "https://app.example.com (no path, no trailing slash, no wildcard)",
+        })
+        return z.NEVER
+      }
+      origins.push(origin)
+    }
+    return [...new Set(origins)]
+  })
+
+/**
  * Comma-separated hostnames OAuth clients may register redirect URIs for.
  * Each entry must be a bare hostname (no scheme, port, path or wildcard);
  * see `normalizeRedirectHost`. An empty list would make OAuth login
@@ -149,6 +190,7 @@ const configSchema = z
       .optional(),
     HTTP_OAUTH_STATE_FILE: z.string().default(defaultOAuthStateFile),
     HTTP_OAUTH_ALLOWED_REDIRECT_HOSTS: redirectHostsFromEnv,
+    HTTP_CORS_ORIGINS: corsOriginsFromEnv,
     HTTP_TRUST_PROXY: trustProxyCoercion,
     // Default 1h idle expiry. `0` remains a valid explicit opt-out that
     // disables idle expiry entirely (sessions only end on protocol

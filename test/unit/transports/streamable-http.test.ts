@@ -68,6 +68,57 @@ describe("StreamableHttpServer", () => {
     if (server) await server.stop().catch(() => {})
   })
 
+  const preflight = (port: number, origin: string) =>
+    request(port, "/mcp", {
+      method: "OPTIONS",
+      headers: {
+        Origin: origin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "authorization,content-type",
+      },
+    })
+
+  it("sends no CORS headers by default, not even for a wildcard", async () => {
+    let port: number
+    ;({ server, port } = await startServer())
+    const res = await preflight(port, "https://evil.example")
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined()
+    const get = await request(port, "/mcp", {
+      headers: { Origin: "https://evil.example", ...AUTH },
+    })
+    expect(get.headers["access-control-allow-origin"]).toBeUndefined()
+  })
+
+  it("allows CORS only for configured origins", async () => {
+    let port: number
+    ;({ server, port } = await startServer({ corsOrigins: ["http://localhost:6274"] }))
+    const allowed = await preflight(port, "http://localhost:6274")
+    expect(allowed.headers["access-control-allow-origin"]).toBe("http://localhost:6274")
+    const allowedHeaders = String(allowed.headers["access-control-allow-headers"]).toLowerCase()
+    for (const header of [
+      "authorization",
+      "x-mcp-token",
+      "mcp-protocol-version",
+      "mcp-session-id",
+    ]) {
+      expect(allowedHeaders).toContain(header)
+    }
+    const other = await preflight(port, "https://evil.example")
+    expect(other.headers["access-control-allow-origin"]).toBeUndefined()
+  })
+
+  it("allows a custom static-token header name in CORS preflights", async () => {
+    let port: number
+    ;({ server, port } = await startServer({
+      corsOrigins: ["http://localhost:6274"],
+      authHeaderName: "x-riffado-key",
+    }))
+    const res = await preflight(port, "http://localhost:6274")
+    expect(String(res.headers["access-control-allow-headers"]).toLowerCase()).toContain(
+      "x-riffado-key",
+    )
+  })
+
   it("refuses to construct without an auth token (no unauthenticated mode)", () => {
     expect(
       () =>
