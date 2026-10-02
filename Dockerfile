@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts
@@ -10,7 +10,7 @@ WORKDIR /app
 COPY . .
 RUN npm run build
 
-FROM node:24-alpine AS runtime
+FROM node:26-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ARG APP_UID=7333
