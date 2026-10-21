@@ -9,7 +9,7 @@ export const TEST_ENCRYPTION_KEY = "11".repeat(32) // 64 hex chars, matches test
 
 export function encryptForTest(plain, hexKey = TEST_ENCRYPTION_KEY) {
   const key = Buffer.from(hexKey, "hex")
-  const iv = randomBytes(12)
+  const iv = randomBytes(16)
   const cipher = createCipheriv("aes-256-gcm", key, iv)
   const ciphertext = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()])
   const tag = cipher.getAuthTag()

@@ -129,8 +129,8 @@ WHERE r.deleted_at IS NULL AND NOT r.is_trash`
 // without decrypting -- or even transferring -- the transcript text itself. `left(t.text, 3)`
 // is a cheap prefix check (not a full-string scan like reverse()/regexp_replace() would be --
 // tried that first, it made the metadata query slower than fetching the text used to be);
-// 61 is strlen("v1:") + a 24-hex-char (12-byte) iv + ":" + a 32-hex-char (16-byte) tag + ":",
-// the standard AES-GCM sizes every writer uses. A row in the rare legacy shape without the
+// 69 is strlen("v1:") + a 32-hex-char (16-byte) iv + ":" + a 32-hex-char (16-byte) tag + ":",
+// the sizes Riffado writes (a 12-byte iv would make it 8 too high -- negligible for an estimate). A row in the rare legacy shape without the
 // "v1:" prefix (still handled correctly by decrypt() itself, just not modeled here) or truly
 // unencrypted falls through to the raw column length -- an overestimate for the former, exact
 // for the latter. Approximate by design: this is a descriptor field, never used for slicing.
@@ -139,7 +139,7 @@ SELECT r.id, r.user_id, r.filename, r.duration, r.start_time,
        t.source, t.provider, t.model, t.detected_language,
        CASE
          WHEN t.text IS NULL THEN NULL
-         WHEN left(t.text, 3) = 'v1:' THEN GREATEST(length(t.text) - 61, 0) / 2
+         WHEN left(t.text, 3) = 'v1:' THEN GREATEST(length(t.text) - 69, 0) / 2
          ELSE length(t.text)
        END AS text_length,
        e.summary, e.key_points::text AS key_points, e.action_items::text AS action_items

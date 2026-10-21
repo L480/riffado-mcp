@@ -9,17 +9,22 @@
 import { createDecipheriv, randomUUID } from "crypto"
 
 const HEX = /^[0-9a-fA-F]+$/
-const IV_HEX_LEN = 24 // 12-byte IV, hex-encoded -- see store.ts's METADATA_QUERY comment.
+/** Riffado writes 16-byte IVs (`randomBytes(16)`); 12-byte (GCM standard) is also accepted. */
+const IV_HEX_LENS = [24, 32]
+const IV_HEX_LEN = 32 // longest accepted IV, hex-encoded
 /** Matches only the IV segment at the START of a `v1:iv:tag:ciphertext`
  * value -- deliberately not the trailing `:tag:ciphertext`, so this also
- * matches a SQL-truncated prefix that never had the rest to begin with. */
-const V1_IV_PREFIX_RE = /^v1:([0-9a-fA-F]{24})/
+ * matches a SQL-truncated prefix that never had the rest to begin with.
+ * 24 or 32 hex chars; the lookahead rejects any other length (a 12-byte IV
+ * is followed by `:` even inside the prefix, a 16-byte one ends exactly at
+ * the prefix boundary). */
+const V1_IV_PREFIX_RE = /^v1:([0-9a-fA-F]{24}(?:[0-9a-fA-F]{8})?)(?![0-9a-fA-F])/
 /** How many leading characters of a `v1:iv:tag:ciphertext` value contain its
  * IV -- `"v1:".length + IV_HEX_LEN`. `RecordingStore`'s phase-1 stamp query
  * selects exactly this many characters (`left(column, IV_STAMP_PREFIX_LEN)`),
  * and `ivStampOf` never looks past this point, so feeding it either the full
  * column value or just that prefix gives the identical result. */
-export const IV_STAMP_PREFIX_LEN = 3 + IV_HEX_LEN // 27
+export const IV_STAMP_PREFIX_LEN = 3 + IV_HEX_LEN // 35
 
 /**
  * Postgres's `jsonb::text` cast canonicalizes the `{"c": "<v1:...>"}`
@@ -28,10 +33,11 @@ export const IV_STAMP_PREFIX_LEN = 3 + IV_HEX_LEN // 27
  * real jsonb column; jsonb never preserves the input's own whitespace).
  */
 const JSON_WRAPPER_PREFIX = '{"c": "v1:'
-const JSON_WRAPPER_V1_IV_PREFIX_RE = /^\{"c": "v1:([0-9a-fA-F]{24})/
+const JSON_WRAPPER_V1_IV_PREFIX_RE =
+  /^\{"c": "v1:([0-9a-fA-F]{24}(?:[0-9a-fA-F]{8})?)(?![0-9a-fA-F])/
 /** Leading characters of a canonical `{"c": "v1:iv:tag:ciphertext"}` jsonb
  * wrapper that contain its IV -- see `IV_STAMP_PREFIX_LEN`. */
-export const JSON_IV_STAMP_PREFIX_LEN = JSON_WRAPPER_PREFIX.length + IV_HEX_LEN // 34
+export const JSON_IV_STAMP_PREFIX_LEN = JSON_WRAPPER_PREFIX.length + IV_HEX_LEN // 42
 
 interface CiphertextParts {
   iv: string
@@ -70,16 +76,16 @@ export function decrypt(value: string | null | undefined, key: Buffer): string {
 
   // parseCiphertext only checks "3 hex parts" -- it has to stay that lax so
   // legacy plaintext detection (falling through to the `return value`
-  // above) isn't disturbed. The standard AES-GCM sizes (12-byte IV,
-  // 16-byte tag) are only enforced here, once a value has already been
+  // above) isn't disturbed. The accepted AES-GCM sizes (16-byte IV as
+  // Riffado writes it, or 12-byte; 16-byte tag) are only enforced here, once a value has already been
   // recognized as v1 ciphertext, so a malformed/truncated value fails
   // loudly instead of silently passing a wrong-length IV/tag to Node's
   // crypto internals.
   // Checked on the hex strings, not the decoded buffers: Buffer.from(hex)
   // silently drops a trailing odd nibble, so a 25-char IV would decode to
   // 12 bytes and an odd-length ciphertext would lose its last half-byte.
-  if (parsed.iv.length !== 24) {
-    throw new Error(`invalid v1 ciphertext: IV must be 24 hex chars, got ${parsed.iv.length}`)
+  if (!IV_HEX_LENS.includes(parsed.iv.length)) {
+    throw new Error(`invalid v1 ciphertext: IV must be 24 or 32 hex chars, got ${parsed.iv.length}`)
   }
   if (parsed.tag.length !== 32) {
     throw new Error(
@@ -111,7 +117,7 @@ export function decrypt(value: string | null | undefined, key: Buffer): string {
  * identical result; the two phases must never disagree about a recording
  * that didn't change, or every recording would look changed forever.
  *
- * A value that doesn't start with the `v1:` + 24-hex-IV shape -- legacy
+ * A value that doesn't start with the `v1:` + 24/32-hex-IV shape -- legacy
  * plaintext, malformed, or shorter than the prefix -- has no IV to key off
  * of. Unlike a full value, a bare prefix can't fall back to "compare the
  * rest of the value too" (there is no rest, in phase 1). Rather than guess,

@@ -161,6 +161,56 @@ describe("RecordingStore incremental refresh", () => {
     expect(calls.filter((c) => c.kind === "metadata")).toHaveLength(1)
   })
 
+  it.each([16, 12])(
+    "refresh returns a recording whose fields all use %i-byte IVs (not skipped)",
+    async (ivBytes) => {
+      const enc = (plain: string) => encryptForTest(plain, TEST_ENCRYPTION_KEY, ivBytes)
+      const f = fixture({
+        filename: enc("A title"),
+        summary: enc("A summary"),
+        keyPoints: pgJsonbWrapper(enc(JSON.stringify(["a point"]))),
+        actionItems: pgJsonbWrapper(enc(JSON.stringify(["an action"]))),
+      })
+      expect(f.meta.filename?.split(":")[1]).toHaveLength(ivBytes * 2)
+      const { pool } = fakePool({ stamp: [[f.stamp]], metadata: [[f.meta]] })
+      const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+
+      const recs = await store.get()
+
+      expect(recs).toHaveLength(1)
+      expect(recs[0].title).toBe("A title")
+      expect(recs[0].summary).toBe("A summary")
+      expect(recs[0].keyPoints).toEqual(["a point"])
+      expect(recs[0].actionItems).toEqual(["an action"])
+    },
+  )
+
+  it("a 16-byte-IV field that differs only in the last 8 IV hex chars is noticed and rebuilt", async () => {
+    const summary = encryptForTest("A summary", TEST_ENCRYPTION_KEY, 16)
+    const f1 = fixture({ summary })
+    // Same ciphertext, tag and first 24 IV chars -- only the IV's tail differs, so phase 1
+    // can only see the change if the stamp covers the whole 32-hex IV.
+    const [, iv, tag, ct] = summary.split(":")
+    const f2 = fixture({ summary: `v1:${iv.slice(0, 24)}${"0".repeat(8)}:${tag}:${ct}` })
+    const f3 = fixture({ summary: `v1:${iv.slice(0, 24)}${"f".repeat(8)}:${tag}:${ct}` })
+    const { pool, calls } = fakePool({
+      stamp: [[f2.stamp], [f3.stamp]],
+      metadata: [
+        [{ ...f2.meta, summary: encryptForTest("S1") }],
+        [{ ...f3.meta, summary: encryptForTest("S2") }],
+      ],
+    })
+    const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
+
+    const first = await store.get()
+    const second = await store.get()
+
+    expect(f1.stamp.summary_prefix).not.toBe(f2.stamp.summary_prefix)
+    expect(second[0]).not.toBe(first[0])
+    expect(calls.filter((c) => c.kind === "metadata")).toHaveLength(2)
+    expect(second[0].summary).toBe("S2")
+  })
+
   it("a recording whose summary was re-encrypted is rebuilt", async () => {
     const f1 = fixture({ summary: encryptForTest("Old summary") })
     const f2 = fixture({ summary: encryptForTest("New summary") })
@@ -539,9 +589,9 @@ describe("safeErrorLabel", () => {
     expect(safeErrorLabel(new SyntaxError('Unexpected token, "secret" is not valid JSON'))).toBe(
       "invalid JSON (SyntaxError)",
     )
-    expect(safeErrorLabel(new Error("invalid v1 ciphertext: IV must be 24 hex chars, got 2"))).toBe(
-      "invalid v1 ciphertext: IV must be 24 hex chars, got 2",
-    )
+    expect(
+      safeErrorLabel(new Error("invalid v1 ciphertext: IV must be 24 or 32 hex chars, got 2")),
+    ).toBe("invalid v1 ciphertext: IV must be 24 or 32 hex chars, got 2")
     expect(safeErrorLabel(new Error("Unsupported state or unable to authenticate data"))).toBe(
       "Unsupported state or unable to authenticate data",
     )

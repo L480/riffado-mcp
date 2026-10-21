@@ -60,7 +60,8 @@ draws a random IV on every encryption, so _any_ re-encryption of a field --
 whatever changed inside it -- necessarily changes its IV; comparing just
 that segment is a correct, decrypt-free change signal. A prefix is enough:
 `ivStampOf`/`jsonIvStampOf` (`crypto.ts`) never look past the IV's own
-position, so a `left(column, IV_STAMP_PREFIX_LEN)` prefix and the full
+position (Riffado's 16-byte IV = 32 hex chars; 12-byte also accepted), so a
+`left(column, IV_STAMP_PREFIX_LEN)` prefix and the full
 column value give the identical stamp for the same row (a unit test asserts
 this equivalence directly, since it's the one invariant the whole scheme
 depends on -- phase 1 and phase 2 must never disagree about a row that
