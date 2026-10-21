@@ -186,13 +186,14 @@ describe("RecordingStore incremental refresh", () => {
   )
 
   it("a 16-byte-IV field that differs only in the last 8 IV hex chars is noticed and rebuilt", async () => {
-    const summary = encryptForTest("A summary", TEST_ENCRYPTION_KEY, 16)
-    const f1 = fixture({ summary })
+    // One shared filename: a fresh one per fixture() would change the filename IV and rebuild
+    // regardless of the summary stamp.
+    const filename = encryptForTest("A title")
+    const [, iv, tag, ct] = encryptForTest("A summary", TEST_ENCRYPTION_KEY, 16).split(":")
     // Same ciphertext, tag and first 24 IV chars -- only the IV's tail differs, so phase 1
     // can only see the change if the stamp covers the whole 32-hex IV.
-    const [, iv, tag, ct] = summary.split(":")
-    const f2 = fixture({ summary: `v1:${iv.slice(0, 24)}${"0".repeat(8)}:${tag}:${ct}` })
-    const f3 = fixture({ summary: `v1:${iv.slice(0, 24)}${"f".repeat(8)}:${tag}:${ct}` })
+    const f2 = fixture({ filename, summary: `v1:${iv.slice(0, 24)}${"0".repeat(8)}:${tag}:${ct}` })
+    const f3 = fixture({ filename, summary: `v1:${iv.slice(0, 24)}${"f".repeat(8)}:${tag}:${ct}` })
     const { pool, calls } = fakePool({
       stamp: [[f2.stamp], [f3.stamp]],
       metadata: [
@@ -202,18 +203,21 @@ describe("RecordingStore incremental refresh", () => {
     })
     const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
 
+    expect({ ...f2.stamp, summary_prefix: null }).toEqual({ ...f3.stamp, summary_prefix: null })
+    expect(f2.stamp.summary_prefix).not.toBe(f3.stamp.summary_prefix)
+
     const first = await store.get()
     const second = await store.get()
 
-    expect(f1.stamp.summary_prefix).not.toBe(f2.stamp.summary_prefix)
     expect(second[0]).not.toBe(first[0])
     expect(calls.filter((c) => c.kind === "metadata")).toHaveLength(2)
     expect(second[0].summary).toBe("S2")
   })
 
   it("a recording whose summary was re-encrypted is rebuilt", async () => {
-    const f1 = fixture({ summary: encryptForTest("Old summary") })
-    const f2 = fixture({ summary: encryptForTest("New summary") })
+    const filename = encryptForTest("A title")
+    const f1 = fixture({ filename, summary: encryptForTest("Old summary") })
+    const f2 = fixture({ filename, summary: encryptForTest("New summary") })
     const { pool } = fakePool({ stamp: [[f1.stamp], [f2.stamp]], metadata: [[f1.meta], [f2.meta]] })
     const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
 
@@ -226,11 +230,14 @@ describe("RecordingStore incremental refresh", () => {
   })
 
   it("a re-encrypted key_points/action_items jsonb wrapper is noticed and rebuilds the recording", async () => {
+    const filename = encryptForTest("A title")
     const f1 = fixture({
+      filename,
       keyPoints: pgJsonbWrapper(encryptForTest(JSON.stringify(["old point"]))),
       actionItems: pgJsonbWrapper(encryptForTest(JSON.stringify([{ what: "old action" }]))),
     })
     const f2 = fixture({
+      filename,
       keyPoints: pgJsonbWrapper(encryptForTest(JSON.stringify(["old point"]))), // same plaintext, fresh IV
       actionItems: f1.meta.action_items as string, // unchanged
     })
@@ -529,8 +536,9 @@ describe("RecordingStore per-recording error isolation", () => {
   })
 
   it("a changed recording that vanishes between phase 1 and phase 2 is dropped, not served stale", async () => {
-    const f1 = fixture({ summary: encryptForTest("Old summary") })
-    const f2 = fixture({ summary: encryptForTest("New summary") })
+    const filename = encryptForTest("A title")
+    const f1 = fixture({ filename, summary: encryptForTest("Old summary") })
+    const f2 = fixture({ filename, summary: encryptForTest("New summary") })
     const { pool } = fakePool({ stamp: [[f1.stamp], [f2.stamp]], metadata: [[f1.meta], []] })
     const store = new RecordingStore({ pool, encryptionKey: KEY, cacheTtlMs: 0 })
     vi.spyOn(console, "error").mockImplementation(() => {})
