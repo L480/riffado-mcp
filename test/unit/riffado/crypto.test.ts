@@ -13,8 +13,9 @@ import {
 const KEY = parseEncryptionKey("a".repeat(64))
 const OTHER_KEY = parseEncryptionKey("b".repeat(64))
 
-function encrypt(plain: string, key: Buffer): string {
-  const iv = randomBytes(12)
+/** `ivBytes` defaults to 16, which is what Riffado writes (`randomBytes(16)`). */
+function encrypt(plain: string, key: Buffer, ivBytes = 16): string {
+  const iv = randomBytes(ivBytes)
   const cipher = createCipheriv("aes-256-gcm", key, iv)
   const ciphertext = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()])
   const tag = cipher.getAuthTag()
@@ -32,6 +33,18 @@ function pgJsonbWrapper(cipher: string): string {
 describe("decrypt", () => {
   it("round-trips a self-generated v1: value", () => {
     const value = encrypt("hallo welt", KEY)
+    expect(decrypt(value, KEY)).toBe("hallo welt")
+  })
+
+  it("decrypts a 16-byte-IV value (32 hex chars) as Riffado writes it", () => {
+    const value = encrypt("hallo welt", KEY, 16)
+    expect(value.split(":")[1]).toHaveLength(32)
+    expect(decrypt(value, KEY)).toBe("hallo welt")
+  })
+
+  it("decrypts a 12-byte-IV value (24 hex chars)", () => {
+    const value = encrypt("hallo welt", KEY, 12)
+    expect(value.split(":")[1]).toHaveLength(24)
     expect(decrypt(value, KEY)).toBe("hallo welt")
   })
 
@@ -72,12 +85,13 @@ describe("decrypt", () => {
     expect(() => decrypt(corrupted, KEY)).toThrow()
   })
 
-  it("throws a clear error for an IV that isn't 12 bytes, without touching crypto internals", () => {
+  it("throws a clear error for an IV that isn't 12 or 16 bytes, without touching crypto internals", () => {
     const value = encrypt("secret", KEY)
     const [, , tag, ciphertext] = value.split(":")
-    const shortIv = "aa".repeat(11) // 11 bytes, not 12
-    const bad = `v1:${shortIv}:${tag}:${ciphertext}`
-    expect(() => decrypt(bad, KEY)).toThrow(/IV must be 24 hex chars/)
+    for (const bytes of [11, 13, 15, 17]) {
+      const bad = `v1:${"aa".repeat(bytes)}:${tag}:${ciphertext}`
+      expect(() => decrypt(bad, KEY)).toThrow(/IV must be 24 or 32 hex chars/)
+    }
   })
 
   it("throws a clear error for a tag that isn't 16 bytes", () => {
@@ -91,8 +105,10 @@ describe("decrypt", () => {
   it("rejects odd-length hex that Buffer.from would silently truncate", () => {
     const value = encrypt("secret", KEY)
     const [, iv, tag, ciphertext] = value.split(":")
-    // 25 hex chars decode to 12 bytes; 33 to 16 -- both must still be rejected.
-    expect(() => decrypt(`v1:${iv}a:${tag}:${ciphertext}`, KEY)).toThrow(/IV must be 24 hex chars/)
+    // 33 hex chars decode to 16 bytes; 33 for the tag likewise -- both must still be rejected.
+    expect(() => decrypt(`v1:${iv}a:${tag}:${ciphertext}`, KEY)).toThrow(
+      /IV must be 24 or 32 hex chars/,
+    )
     expect(() => decrypt(`v1:${iv}:${tag}b:${ciphertext}`, KEY)).toThrow(
       /auth tag must be 32 hex chars/,
     )
@@ -126,6 +142,11 @@ describe("decryptJson", () => {
     const wrapper = JSON.stringify({ c: encrypt(inner, KEY) })
     expect(decryptJson(wrapper, KEY)).toEqual(["item one", "item two"])
   })
+
+  it("unwraps a {c: ciphertext} wrapper with a 12-byte IV", () => {
+    const wrapper = JSON.stringify({ c: encrypt(JSON.stringify(["x"]), KEY, 12) })
+    expect(decryptJson(wrapper, KEY)).toEqual(["x"])
+  })
 })
 
 describe("ivStampOf", () => {
@@ -133,6 +154,32 @@ describe("ivStampOf", () => {
     const value = encrypt("hallo welt", KEY)
     const iv = value.split(":")[1]
     expect(ivStampOf(value)).toBe(iv)
+  })
+
+  it("returns the full 32-hex IV of a 16-byte-IV value", () => {
+    const value = encrypt("hallo welt", KEY, 16)
+    expect(ivStampOf(value)).toBe(value.split(":")[1])
+    expect(ivStampOf(value)).toHaveLength(32)
+  })
+
+  it("changes when only the last 8 hex chars of a 16-byte IV change", () => {
+    const value = encrypt("hallo welt", KEY, 16)
+    const [, iv, tag, ct] = value.split(":")
+    const other = `v1:${iv.slice(0, 24)}${"0".repeat(8)}:${tag}:${ct}`
+    const other2 = `v1:${iv.slice(0, 24)}${"f".repeat(8)}:${tag}:${ct}`
+    expect(ivStampOf(other)).not.toBe(ivStampOf(other2))
+    expect(ivStampOf(other.slice(0, IV_STAMP_PREFIX_LEN))).toBe(ivStampOf(other))
+  })
+
+  it("returns the 24-hex IV of a 12-byte-IV value, identical for full value and prefix", () => {
+    const value = encrypt("hallo welt", KEY, 12)
+    expect(ivStampOf(value)).toBe(value.split(":")[1])
+    expect(ivStampOf(value.slice(0, IV_STAMP_PREFIX_LEN))).toBe(ivStampOf(value))
+  })
+
+  it("treats an IV of any other length as unknown (always-different marker)", () => {
+    const odd = `v1:${"ab".repeat(13)}:${"cd".repeat(16)}:ef`
+    expect(ivStampOf(odd)).not.toBe(ivStampOf(odd))
   })
 
   it("changes when the value is re-encrypted (fresh IV), even for identical plaintext", () => {
@@ -183,6 +230,20 @@ describe("jsonIvStampOf", () => {
     const wrapperA = pgJsonbWrapper(encrypt(inner, KEY))
     const wrapperB = pgJsonbWrapper(encrypt(inner, KEY))
     expect(jsonIvStampOf(wrapperA)).not.toBe(jsonIvStampOf(wrapperB))
+  })
+
+  it("covers the full 32-hex IV of a 16-byte-IV value, identical for wrapper and prefix", () => {
+    const cipher = encrypt("[]", KEY, 16)
+    const wrapper = pgJsonbWrapper(cipher)
+    expect(jsonIvStampOf(wrapper)).toBe(cipher.split(":")[1])
+    expect(jsonIvStampOf(wrapper.slice(0, JSON_IV_STAMP_PREFIX_LEN))).toBe(jsonIvStampOf(wrapper))
+  })
+
+  it("returns the 24-hex IV of a 12-byte-IV value, identical for wrapper and prefix", () => {
+    const cipher = encrypt("[]", KEY, 12)
+    const wrapper = pgJsonbWrapper(cipher)
+    expect(jsonIvStampOf(wrapper)).toBe(cipher.split(":")[1])
+    expect(jsonIvStampOf(wrapper.slice(0, JSON_IV_STAMP_PREFIX_LEN))).toBe(jsonIvStampOf(wrapper))
   })
 
   it("gives the identical result for the full wrapper and just its JSON_IV_STAMP_PREFIX_LEN prefix", () => {

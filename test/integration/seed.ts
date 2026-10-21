@@ -10,9 +10,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export const TEST_ENCRYPTION_KEY = "11".repeat(32) // 64 hex chars
 
-export function encryptForTest(plain: string, hexKey: string = TEST_ENCRYPTION_KEY): string {
+/** `ivBytes` defaults to 16, which is what Riffado writes (`randomBytes(16)`). */
+export function encryptForTest(
+  plain: string,
+  hexKey: string = TEST_ENCRYPTION_KEY,
+  ivBytes = 16,
+): string {
   const key = Buffer.from(hexKey, "hex")
-  const iv = randomBytes(12)
+  const iv = randomBytes(ivBytes)
   const cipher = createCipheriv("aes-256-gcm", key, iv)
   const ciphertext = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()])
   const tag = cipher.getAuthTag()
