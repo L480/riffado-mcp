@@ -17,13 +17,15 @@ ARG APP_UID=7333
 
 COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --ignore-scripts
+ARG VERSION=0.0.0
 
 # The entrypoint is `node dist/index.js` — npm/npx/yarn are never invoked at
 # runtime, but node:24-alpine bundles them anyway, and their own dependency
 # trees (not this app's — `npm audit --omit=dev` is clean) are what a Trivy
 # scan of the published image actually flags. Must run after `npm ci` above,
 # which still needs npm; removing it earlier breaks the build.
-RUN rm -rf \
+RUN npm pkg set version="${VERSION}" \
+  && rm -rf \
   /usr/local/lib/node_modules/npm \
   /usr/local/bin/npm \
   /usr/local/bin/npx \
