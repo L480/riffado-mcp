@@ -17,6 +17,8 @@ ARG APP_UID=7333
 
 COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --ignore-scripts
+ARG VERSION=0.0.0
+RUN npm pkg set version="${VERSION}"
 
 # The entrypoint is `node dist/index.js` — npm/npx/yarn are never invoked at
 # runtime, but node:24-alpine bundles them anyway, and their own dependency
