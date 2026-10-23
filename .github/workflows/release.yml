@@ -68,6 +68,12 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ env.REPO_OWNER }}/riffado-mcp
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
 
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -82,10 +88,11 @@ jobs:
           outputs: type=image,name=ghcr.io/${{ env.REPO_OWNER }}/riffado-mcp,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -143,14 +150,18 @@ jobs:
 
       - id: resolve
         name: Resolve manifest-list digest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          digest=$(docker buildx imagetools inspect "ghcr.io/${REPO_OWNER}/riffado-mcp:${{ steps.meta.outputs.version }}" --format '{{json .Manifest}}' | jq -r .digest)
+          digest=$(docker buildx imagetools inspect "ghcr.io/${REPO_OWNER}/riffado-mcp:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign image (keyless)
+        env:
+          IMAGE_DIGEST: ${{ steps.resolve.outputs.digest }}
         run: |
-          cosign sign --yes "ghcr.io/${REPO_OWNER}/riffado-mcp@${{ steps.resolve.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${REPO_OWNER}/riffado-mcp@${IMAGE_DIGEST}"
 
   github-release:
     name: Create GitHub Release
@@ -165,18 +176,23 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - id: tag_message
-        name: Read annotated tag message
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          delim="EOF_$(openssl rand -hex 16)"
+          # UI-published releases already exist: keep their notes.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "::notice::Release ${TAG} already exists; keeping its notes"
+            exit 0
+          fi
+          notes="$(mktemp)"
           {
-            echo "body<<${delim}"
-            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}"
-            echo "${delim}"
-          } >> "${GITHUB_OUTPUT}"
-
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          body: ${{ steps.tag_message.outputs.body }}
-          append_body: true
-          generate_release_notes: true
+            # Only annotated tags carry their own message.
+            if [ "$(git cat-file -t "${TAG}")" = tag ]; then
+              git tag -l --format='%(contents)' "${TAG}"
+              echo
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" -f tag_name="${TAG}" --jq .body
+          } > "${notes}"
+          gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" --notes-file "${notes}"
